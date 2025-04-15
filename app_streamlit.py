@@ -1,176 +1,173 @@
+import streamlit as st
 import torch
-import torch.nn as nn
-import torchvision.transforms as T
-import torch.nn.functional as F
-from skimage import transform
+import numpy as np
+import matplotlib.pyplot as plt
+from transformers import BlipProcessor, BlipForConditionalGeneration
+from transformers import AutoProcessor, AutoModelForVisualQuestionAnswering
 from PIL import Image, ImageOps
 import io
-import streamlit as st
-import os
-from download_files import *
-from matplotlib import pyplot as plt
-import wget
+import torchvision.transforms as T
+import torch.nn.functional as F
 
-from model import *
-from dataset import Vocabulary
+# **Cek Device**
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
+# **Konfigurasi Halaman Streamlit**
 st.set_page_config(
     initial_sidebar_state="expanded",
     page_title="Explainable Image Caption Bot"
 )
 
+# **Load Model BLIP**
+@st.cache_resource
+def load_blip_model():
+    # processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+    # model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(device)
+    processor = AutoProcessor.from_pretrained("Salesforce/blip2-opt-2.7b")
+    model = AutoModelForVisualQuestionAnswering.from_pretrained("Salesforce/blip2-opt-2.7b").to(device)
+    return processor, model
 
-def transform_img(img):
-    transforms = T.Compose([
-        T.Resize((224, 224)),
+processor, model = load_blip_model()
+
+# **Transformasi Gambar untuk Model**
+def transform_image(img):
+    transform = T.Compose([
+        T.Resize((384, 384)),  # Resize sesuai model BLIP
         T.ToTensor(),
-        T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+        T.Normalize((0.5,), (0.5,))
     ])
-    return transforms(img)
+    return transform(img)
 
+def generate_caption(image, processor, model):
+    inputs = processor(images=image, return_tensors="pt").to(device)
 
-@st.cache(ttl=86400, max_entries=15)
-def download_checkpoints():
-    path = "./attention_model_state.pth"
-    if not os.path.exists(path):
-        with st.spinner('Downloading state checkpoint...'):
-            model_url = "wget -O ./attention_model_state.pth https://www.dropbox.com/s/6qw5jhumzuu4zzl/attention_model_state.pth?dl=0"
-            os.system(model_url)
+    # Pastikan kita menangkap perhatian dari Transformer
+    attention_maps = []
 
-    print("Model Downloaded")
+    def get_attention_hook(module, input, output):
+        print("✅ Hook executed! Attention captured.")  # Debugging
+        attention_maps.append(output)  # Output adalah tuple
 
+    # Pasang hook ke layer yang sesuai
+    handle = model.vision_model.encoder.layers[-1].self_attn.register_forward_hook(get_attention_hook)
 
-@st.cache(ttl=21600, max_entries=15)
-def load_model():
-    state_checkpoint = torch.load("./attention_model_state.pth", map_location=device)  # change paths
-    # model params
-    vocab = state_checkpoint['vocab']
-    embed_size = 300
-    embed_wts = None
-    vocab_size = state_checkpoint['vocab_size']
-    attention_dim = 256
-    encoder_dim = 2048
-    decoder_dim = 512
-    fc_dims = 256
-
-    model = EncoderDecoder(embed_size,
-                           vocab_size,
-                           attention_dim,
-                           encoder_dim,
-                           decoder_dim,
-                           fc_dims,
-                           p=0.3,
-                           embeddings=embed_wts).to(device)
-
-    model.load_state_dict(state_checkpoint['state_dict'])
-    return model, vocab
-
-
-def get_caps_from(features_tensors, model, vocab=None):
-    model.eval()
+    # Generate caption
     with torch.no_grad():
-        features = model.EncoderCNN(features_tensors[0:1].to(device))
-        caps, alphas = model.DecoderLSTM.gen_captions(features, vocab=vocab)
-        caps_temp = [c for c in caps if c not in "<EOS>"]
-        caption = ' '.join(caps_temp)
+        caption_ids = model.generate(**inputs)
 
-    return caption, caps, alphas
+    # Hapus hook setelah digunakan
+    handle.remove()
 
+    caption = processor.decode(caption_ids[0], skip_special_tokens=True)
 
-def plot_attention(img, target, attention_plot):
-    img[0] = img[0] * 0.229
-    img[1] = img[1] * 0.224
-    img[2] = img[2] * 0.225
-    img[0] += 0.485
-    img[1] += 0.456
-    img[2] += 0.406
-    img = img.to('cpu').numpy().transpose((1, 2, 0))
+    # **Periksa apakah attention_maps berhasil ditangkap**
+    if not attention_maps:
+        print("❌ Attention Maps tidak terisi! Hook mungkin tidak bekerja.")
+        return caption, None
 
-    temp_image = img
+    # **Ambil tensor dari tuple**
+    attention_tensor = attention_maps[0][0]  # Ambil tensor pertama dari tuple
+    attention = attention_tensor.cpu().detach().numpy().mean(axis=1)
 
-    fig = plt.figure(figsize=(10, 10))
-    len_caps = len(target)
-    for i in range(len_caps):
-        temp_att = attention_plot[i].reshape(7, 7)
-        temp_att = transform.pyramid_expand(temp_att, upscale=24, sigma=8)
-        ax = fig.add_subplot(len_caps // 2, len_caps // 2, i + 1)
-        ax.set_axis_off()
-        ax.set_title(target[i])
-        img = ax.imshow(temp_image)
-        ax.imshow(temp_att, cmap='gray', alpha=0.8, extent=img.get_extent())
-
-    plt.tight_layout()
-    st.pyplot(fig)
+    return caption, attention
 
 
-def plot_caption_with_attention(img_pth, model, transforms_=None, vocab=None):
-    img = Image.open(img_pth)
-    img = transforms_(img)
-    img.unsqueeze_(0)
-    caption, caps, attention = get_caps_from(img, model, vocab)
-    st.markdown(f"## Image Caption:\n"
-                f" #### {caption}\n\n")
-    plot_attention(img[0], caps, attention)
-
-
-@st.cache(ttl=3600, max_entries=10)
-def load_output_image(img):
+# **Fungsi untuk Memuat Gambar**
+@st.cache_data
+def load_uploaded_image(img):
     if isinstance(img, str):
         image = Image.open(img)
     else:
         img_bytes = img.read()
         image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-
-    image = ImageOps.exif_transpose(image)
+    
+    image = ImageOps.exif_transpose(image)  # Perbaiki orientasi gambar
     return image
 
+def plot_attention(image, caption, attention):
+    """
+    Menampilkan heatmap attention untuk setiap kata dalam caption.
+    """
 
-if __name__ == '__main__':
+    if attention is None or len(attention.shape) != 2:
+        st.error("Attention map tidak valid! Tidak bisa menampilkan heatmap.")
+        return
 
-    download_checkpoints()
-    model, vocab = load_model()
+    num_words = len(caption.split())
+    num_attention_steps = min(num_words, attention.shape[0])  # Sesuaikan panjang attention
 
-    st.title("The Explainable Image Captioning Bot")
-    st.text("")
-    st.text("")
-    st.success("Welcome! Please upload an image!"
-               )
+    fig, axes = plt.subplots(1, num_attention_steps, figsize=(num_attention_steps * 3, 5))
 
-    img_upload = st.file_uploader(label='Upload Image', type=['png', 'jpg', 'jpeg', 'webp'])
-    img_pt = "imgs/test2.jpeg" if img_upload is None else img_upload
+    if num_attention_steps == 1:
+        axes = [axes]  # Pastikan list jika hanya ada satu kata
 
-    image = load_output_image(img_pt)
+    for i in range(num_attention_steps):
+        attn_map = attention[i]
 
-    st.sidebar.markdown('''
-    ### Introduction:
-    Hello! :hand: and Welcome,
-    This is a Image caption bot:\n
-     Its main job is to give captions :speech_balloon: or description for your
-     input image.\n
-     But we have tried something different here \n
-     This app gives 2 outputs
-    - The Caption for your image duh? :upside_down_face:
-    - Explaination as in a image grid i.e. the parts of the image
-    where the AI looks when trying to caption your image :nerd_face: \n
-    ### Explaination of Captions:
-    The white regions in each image of the resultant grid of images shows the regions where the deep learning models
-    focuses to get that perticular word mentioned in the image title.\n
-    ### Instructions to use
-    If you are getting random captions, then try :-
-    - Using a PC
-    - Try images of bicycles or motarbikes
-    - Try images with children in it
-    - Try images of dogs
-    ''')
+        # **Reshape attention ke bentuk yang sesuai**
+        if attn_map.shape[0] == 768:
+            grid_size = 24  # Vision Transformer biasanya menggunakan 24x32 patches
+            attn_map = attn_map[:grid_size * grid_size].reshape(grid_size, grid_size)
+        else:
+            st.warning(f"Attention map tidak bisa diubah menjadi grid! (Token count: {attn_map.shape[0]})")
+            continue
 
-    st.sidebar.markdown('''Check the model details [here](https://github.com/mrFahrenhiet/Explainable_Image_Caption_bot)
-    \n Liked it? Give a :star:  on GitHub ''')
+        # **Interpolasi agar ukuran sesuai dengan gambar**
+        attn_resized = F.interpolate(
+            torch.tensor(attn_map).unsqueeze(0).unsqueeze(0), 
+            size=(image.size[1], image.size[0]),  # Sesuaikan ke ukuran gambar
+            mode="bilinear",
+            align_corners=False
+        ).squeeze().numpy()
 
-    st.image(image, use_column_width=True)
+        # **Plot setiap heatmap per kata**
+        axes[i].imshow(image)
+        axes[i].imshow(attn_resized, cmap='jet', alpha=0.5)
+        axes[i].set_title(caption.split()[i])
+        axes[i].axis("off")
 
-    if st.button('Generate captions!'):
-        plot_caption_with_attention(img_pt, model, transform_img, vocab)
-        st.success("Try a different image by uploading")
-        st.balloons()
+    plt.tight_layout()
+    st.pyplot(fig)
+
+# **Streamlit UI**
+st.title("Explainable Image Captioning Bot 🤖🖼️")
+st.text("Powered by BLIP (Salesforce) - A Transformer-based Image Captioning Model")
+
+st.success("Upload an image and generate a caption!")
+
+# **File Upload**
+uploaded_file = st.file_uploader("Upload an image (JPG, PNG, JPEG)", type=["png", "jpg", "jpeg", "webp"])
+img_path = "imgs/test2.jpeg" if uploaded_file is None else uploaded_file
+
+# **Muat dan Tampilkan Gambar**
+image = load_uploaded_image(img_path)
+st.image(image, use_column_width=True, caption="Uploaded Image")
+
+# **Generate Caption Button**
+# Jika tombol ditekan, jalankan captioning dan attention visualization
+if st.button("Generate Caption"):
+    caption, attention = generate_caption(image, processor, model)
+
+    if attention is None:
+        st.error("Attention map tidak tersedia! Coba ganti layer yang di-hook.")
+    else:
+        st.markdown(f"### **Generated Caption:**\n📢 *{caption}*")
+        plot_attention(image, caption, attention)  # ✅ Panggil dengan 3 argumen
+
+    st.balloons()
+
+
+# **Sidebar Info**
+st.sidebar.markdown("""
+### About This App 📝
+This app generates captions for images using **Hugging Face's BLIP model** trained by **Salesforce**.  
+It also provides **explainable AI insights** into how images are understood by deep learning models.
+
+### How to Use:
+1. **Upload an image** 📷 (JPG/PNG/JPEG).
+2. **Click "Generate Caption"** 🏷️.
+3. **View AI-generated caption** for your image along with **attention heatmap**!
+
+### Want More Features?
+Check the model on [Hugging Face](https://huggingface.co/Salesforce/blip-image-captioning-base).
+""")

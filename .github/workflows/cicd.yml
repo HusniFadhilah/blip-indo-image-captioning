@@ -14,21 +14,21 @@ jobs:
       - name: Login to Docker Hub
         run: docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
       - name: Build Docker Image
-        run: docker build -t husnifd/api-jelajah-medika .
+        run: docker build -t husnifd/x-capindo .
       - name: Run Unit Tests
-        run: docker run husnifd/api-jelajah-medika python -m unittest discover tests
+        run: docker run husnifd/x-capindo python -m unittest discover tests
       - name: Publish image to docker hub
-        run: docker push husnifd/api-jelajah-medika:latest  
+        run: docker push husnifd/x-capindo:latest  
 
   deploy:
     needs: build
     runs-on: self-hosted
     steps:
       - name: Pull image from docker hub
-        run: sudo docker pull husnifd/api-jelajah-medika:latest
+        run: sudo docker pull husnifd/x-capindo:latest
       - name: Delete Old Container
-        run: sudo docker rm -f apiJelajahMedikaContainer
+        run: sudo docker rm -f xCapIndoContainer
       - name: Run docker container
-        run: sudo docker run -d -p 6000:6000 --name apiJelajahMedikaContainer husnifd/api-jelajah-medika
+        run: sudo docker run -d -p 6600:6600 --name xCapIndoContainer husnifd/x-capindo
       - name: Delete Not Associate Image
         run: sudo docker image prune -af

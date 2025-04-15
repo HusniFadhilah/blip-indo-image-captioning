@@ -15,10 +15,10 @@ COPY . /app
 # COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-EXPOSE 6000
+EXPOSE 6600
 
 # Install Gunicorn
 # RUN pip install gunicorn
 # CMD python ./app.py
-# CMD ["gunicorn", "--bind", "0.0.0.0:6000", "app:app"]
-CMD ["streamlit", "run", "app_streamlit.py", "--server.port=6000", "--server.address=0.0.0.0"]
+# CMD ["gunicorn", "--bind", "0.0.0.0:6600", "app:app"]
+CMD ["streamlit", "run", "app_streamlit.py", "--server.port=6600", "--server.address=0.0.0.0"]

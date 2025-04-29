@@ -1,0 +1,12 @@
+version:  "3.11"
+
+services:
+  x-capindo:
+    container_name: x-capindo
+    image: x-capindo
+    ports:
+      - "6000:6000"
+    build:
+      context: .
+      dockerfile: Dockerfile
+      

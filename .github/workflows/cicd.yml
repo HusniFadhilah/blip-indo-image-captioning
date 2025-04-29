@@ -1,0 +1,32 @@
+name: CICD
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v3
+      - name: Login to Docker Hub
+        run: docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+      - name: Build Docker Image
+        run: docker build -t husnifd/x-capindo .
+      - name: Publish image to docker hub
+        run: docker push husnifd/x-capindo:latest  
+
+  deploy:
+    needs: build
+    runs-on: self-hosted
+    steps:
+      - name: Pull image from docker hub
+        run: sudo docker pull husnifd/x-capindo:latest
+      - name: Delete Old Container
+        run: sudo docker rm -f xCapIndoContainer
+      - name: Run docker container
+        run: sudo docker run -d -p 6600:6600 --name xCapIndoContainer husnifd/x-capindo
+      - name: Delete Not Associate Image
+        run: sudo docker image prune -af

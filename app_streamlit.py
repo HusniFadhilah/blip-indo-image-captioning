@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from captum.attr import Saliency
 from pytorch_grad_cam import EigenCAM, KPCA_CAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
+from huggingface_hub import snapshot_download
 
 # ====== Konfigurasi ======
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -32,8 +33,12 @@ with col2:
 
 # ====== Load Model Lokal ======
 @st.cache_resource
-def load_blip_model():
-    model_path = r"models/v1.0/blip-image-captioning-large"
+def load_blip_model(is_local=False):
+    if is_local:
+        model_path = r"models/blip-image-captioning-large/v1.0"
+    else:
+        model_path = snapshot_download(repo_id=r"HusniFd/blip-image-captioning-large")
+    
     processor = BlipProcessor.from_pretrained(model_path)
     model = BlipForConditionalGeneration.from_pretrained(model_path).to(device)
     return processor, model

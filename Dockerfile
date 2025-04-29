@@ -12,8 +12,8 @@ WORKDIR /app
 RUN mkdir logs
 COPY . /app
 
-# COPY requirements.txt .
-RUN pip install -r requirements.txt
+COPY requirements.txt .
+RUN pip install -r ./requirements.txt
 
 EXPOSE 6600
 

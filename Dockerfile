@@ -7,6 +7,9 @@ ENV FLASK_DEBUG=0
 ENV FLASK_APP=app.py
 ENV LOG_PATH_APP=./logs/app.log
 
+# Tambahkan dependensi sistem untuk OpenCV
+RUN apt-get update && apt-get install -y libgl1-mesa-glx
+
 WORKDIR /app
 # Create logs directory
 RUN mkdir logs

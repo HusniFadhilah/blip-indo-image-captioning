@@ -1,39 +1,60 @@
-import os
-os.environ["STREAMLIT_WATCHED_MODULES"] = ""
-
-import torch, cv2, time
+# Streamlit Wizard for BLIP Image Captioning – Updated with CAM & Cross-Attention
 import streamlit as st
-import numpy as np
 import matplotlib.pyplot as plt
-from transformers import BlipProcessor, BlipForConditionalGeneration
+import numpy as np
+import cv2
+import torch
 from PIL import Image, ImageOps
-import io
-import torchvision.transforms as T
-import torch.nn.functional as F
-from captum.attr import Saliency
 from pytorch_grad_cam import EigenCAM, KPCA_CAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
-from huggingface_hub import snapshot_download
+from captum.attr import Saliency
+import torchvision
+from transformers import BlipProcessor, BlipForConditionalGeneration
+import io, math
 
-# ====== Konfigurasi ======
-device = "cuda" if torch.cuda.is_available() else "cpu"
-st.set_page_config(page_title="X-Capindo", page_icon="imgs/logo.png", layout="wide")
+# --- Setup ---
+st.set_page_config(page_title="X-Capindo - Visualisasi Proses Image Captioning", page_icon="imgs/logo.png", layout="wide")
+st.markdown("""
+<style>
+    .main-header { font-size: 2.5rem; font-weight: bold; color: #1E3A8A; text-align: center; margin-bottom: 1rem; }
+    .sub-header { font-size: 1.2rem; color: #4B5563; text-align: center; margin-bottom: 2rem; }
+    .step-header { font-size: 1.8rem; font-weight: bold; color: #1E3A8A; margin-bottom: 1rem; }
+    .step-description { font-size: 1.1rem; color: #4B5563; margin-bottom: 1.5rem; }
+    .tech-details { background-color: #EFF6FF; border-radius: 0.5rem; padding: 1rem; margin-bottom: 1.5rem; }
+    .stButton button { width: 100%; }
+</style>
+""", unsafe_allow_html=True)
 
-# ====== Header & Logo ======
-col1, col2 = st.columns([1, 8])
-with col1:
-    st.image("imgs/logo.png", width=90)  # Logo diganti di sini
-with col2:
-    st.title("X-Capindo – Captioning dan Eksplorasi Fokus Gambar Berbahasa Indonesia")
+# --- Title ---
+st.markdown('<div class="main-header">Visualisasi Proses Image Captioning</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Pelajari tahapan bagaimana AI menghasilkan deskripsi dari gambar</div>', unsafe_allow_html=True)
+
+# --- Sidebar Info ---
+with st.sidebar.expander("ℹ️ Tentang X-Capindo", expanded=False):
+    st.image("imgs/logo.png", width=90)
     st.markdown("""
-    Aplikasi ini menggunakan model **BLIP** untuk menghasilkan deskripsi otomatis dari gambar, dilengkapi dengan **penjelasan visual (explainable AI)** seperti **CAM**, **Attention Rollout**, dan **Saliency Map**.
+**X-Capindo** adalah aplikasi captioning berbasis BLIP (Salesforce) yang dilengkapi dengan penjelasan visual melalui CAM (Class Activation Maps), attention transformer, dan feature map.
 
-    Setiap peta atensi disertai *Skor Fokus*, yang menunjukkan seberapa terfokus perhatian model terhadap objek penting.
+**Langkah-langkah**:
+1. Unggah gambar yang ingin dideskripsikan.
+2. Lihat area fokus menggunakan CAM.
+3. Tinjau feature map dan cross-attention.
+4. Amati proses decoding.
+5. Dapatkan caption akhir.
+    """)
+    st.markdown("""
+**Model**: BLIP (Base) – `Salesforce/blip-image-captioning-base`
+
+**Teknik XAI**:
+- EigenCAM / KPCA-CAM
+- Attention Rollout
+- Saliency Map
+- Cross-Attention Decoder
     """)
 
-# ====== Load Model Lokal atau dari Huggingface ======
+# --- Model Load (once) ---
 @st.cache_resource
-def load_blip_model(model_choice):
+def load_model(model_choice="BLIP-Base (local)"):
     if model_choice == "BLIP-Base (local)":
         model_path = r"models/blip-image-captioning-base/v1.0"
     elif model_choice == "BLIP-Large (local)":
@@ -45,14 +66,12 @@ def load_blip_model(model_choice):
     else:
         raise ValueError("Model tidak dikenali.")
     processor = BlipProcessor.from_pretrained(model_path)
-    model = BlipForConditionalGeneration.from_pretrained(model_path).to(device)
+    model = BlipForConditionalGeneration.from_pretrained(model_path).to("cpu")
     return processor, model
 
-# ====== Pilih Model ======
-model_choice = st.selectbox("Pilih Model Captioning:", ["BLIP-Large (HF Hub)", "BLIP-Base (HF Hub)","BLIP-Base (local)","BLIP-Large (local)"])
-processor, model = load_blip_model(model_choice)
+processor, model = load_model()
 
-# ====== Utilitas Gambar ======
+# --- Image Upload Helper ---
 @st.cache_data
 def load_uploaded_image(img):
     if isinstance(img, str):
@@ -61,41 +80,59 @@ def load_uploaded_image(img):
         image = Image.open(io.BytesIO(img.read())).convert("RGB")
     return ImageOps.exif_transpose(image)
 
-def transform_to_tensor(image):
-    return processor(images=image, return_tensors="pt").pixel_values.to(device)
+# --- Step logic ---
+steps = [
+    {"title": "Unggah Gambar", "description": "Sistem menerima gambar dari pengguna", "tech_details": "Gambar diubah menjadi tensor 3-channel dengan normalisasi dan penskalaan untuk digunakan model."},
+    {"title": "Peta Aktivasi (CAM)", "description": "Visualisasi fokus model pada gambar", "tech_details": "Menggunakan teknik explainability: EigenCAM, KPCA-CAM, Attention Rollout, dan Saliency Map untuk menampilkan area penting yang diproses model."},
+    {"title": "Feature Map", "description": "Ekstraksi dan visualisasi saluran fitur dari encoder", "tech_details": "Menampilkan 16 channel awal dari token visual BLIP (tanpa CLS), disusun dalam grid 4x4 sebagai representasi patch embedding."},
+    {"title": "Cross-Attention per Kata", "description": "Visualisasi atensi model terhadap setiap kata yang dihasilkan", "tech_details": "Membandingkan peta atensi cross-attention decoder dengan hasil Grad-CAM untuk setiap token dalam caption."},
+    {"title": "Generasi Caption", "description": "Caption akhir berdasarkan analisis visual dan bahasa", "tech_details": "Model BLIP menghasilkan deskripsi kata demi kata dengan bantuan beam search dan pengaruh dari representasi visual."},
+]
 
-# ====== Caption dan Attention ======
-def generate_caption(image):
-    inputs = processor(images=image, return_tensors="pt").to(device)
-    attention_maps = []
+# --- Session state init ---
+if "current_step" not in st.session_state:
+    st.session_state.current_step = 0
+if "image" not in st.session_state:
+    st.session_state.image = None
 
-    def hook(module, input, output):
-        attention_maps.append(output)
+# --- Step Navigator ---
+progress_bar = st.progress(st.session_state.current_step / (len(steps) - 1))
+cols = st.columns(len(steps))
+for i, col in enumerate(cols):
+    with col:
+        if st.button(f"{i+1}. {steps[i]['title']}", key=f"step_{i}"):
+            st.session_state.current_step = i
+            st.rerun()
 
-    handle = model.vision_model.encoder.layers[-1].self_attn.register_forward_hook(hook)
-    start = time.time()
-    with torch.no_grad():
-        output_ids = model.generate(**inputs)
-    inference_time = time.time() - start
+current_step = steps[st.session_state.current_step]
+st.markdown(f'<div class="step-header">Langkah {st.session_state.current_step + 1}: {current_step["title"]}</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="step-description">{current_step["description"]}</div>', unsafe_allow_html=True)
+with st.expander("Tampilkan Detail Teknis"):
+    st.markdown(f'<div class="tech-details">{current_step["tech_details"]}</div>', unsafe_allow_html=True)
 
-    handle.remove()
-    caption = processor.decode(output_ids[0], skip_special_tokens=True)
-    attention = attention_maps[0][0].cpu().detach().numpy().mean(axis=1) if attention_maps else None
-    return caption, attention, inference_time
+# --- Step 1: Image Upload ---
+if st.session_state.current_step == 0:
+    col_left, col_right = st.columns([1, 2])
+    with col_left:
+        if st.session_state.image is None:
+            st.image("imgs/test5.jpg", caption="Contoh Gambar Input", use_container_width=True)
+        else:
+            st.image(st.session_state.image, caption="🖼️ Gambar yang Diunggah", use_container_width=True)
+        st.caption("Format yang didukung: JPG, PNG, WEBP")
+    with col_right:
+        uploaded_file = st.file_uploader("Unggah gambar Anda", type=["jpg", "jpeg", "png", "webp"])
+        if uploaded_file:
+            st.session_state.image = load_uploaded_image(uploaded_file)
+            st.rerun()
 
-# ====== Skor Fokus ======
-def compute_focus_score(attn_map):
-    flat = attn_map.flatten()
-    flat = flat / (flat.sum() + 1e-8)
-    entropy = -np.sum(flat * np.log(flat + 1e-8))
-    normalized_entropy = entropy / np.log(len(flat))
-    focus_score = 1 - normalized_entropy
-    return round(focus_score, 3)
+# --- Step 2: Visualisasi CAM ---
+if st.session_state.current_step == 1:
+    st.subheader("🔍 Pilih Teknik Visualisasi Fokus Gambar")
+    selected_cam = st.selectbox("Metode Explainability", ["EigenCAM", "KPCA-CAM", "Attention Rollout", "Saliency Map"])
 
-# ====== CAM Visualisasi ======
-def compute_visual_explanations(image_pil, input_tensor, caption):
-    rgb_image = input_tensor[0].detach().cpu().permute(1, 2, 0).numpy()
-    rgb_image = (rgb_image - rgb_image.min()) / (rgb_image.max() - rgb_image.min() + 1e-8)
+    image = st.session_state.image or load_uploaded_image("imgs/test5.jpg")
+    input_tensor = processor(images=image, return_tensors="pt").pixel_values
+    rgb_image = np.array(image).astype(np.float32) / 255.0
 
     class BlipWrapper(torch.nn.Module):
         def __init__(self, patch_module): super().__init__(); self.patch_module = patch_module
@@ -104,138 +141,46 @@ def compute_visual_explanations(image_pil, input_tensor, caption):
     wrapped = BlipWrapper(model.vision_model.embeddings.patch_embedding)
     target_layers = [model.vision_model.embeddings.patch_embedding]
 
-    visuals = {}
-    scores = {}
-    times = {}
+    if selected_cam == "EigenCAM":
+        cam = EigenCAM(model=wrapped, target_layers=target_layers)
+        cam_map = cam(input_tensor=input_tensor)[0]
+    elif selected_cam == "KPCA-CAM":
+        cam = KPCA_CAM(model=wrapped, target_layers=target_layers)
+        cam_map = cam(input_tensor=input_tensor)[0]
+    elif selected_cam == "Attention Rollout":
+        def rollout_fn(pixel_values):
+            attn_maps = []
+            def hook(module, input, output):
+                if isinstance(output, tuple): attn_maps.append(output[1].detach().cpu())
+            hooks = [layer.self_attn.register_forward_hook(hook) for layer in model.vision_model.encoder.layers]
+            with torch.no_grad(): _ = model.vision_model(pixel_values, output_attentions=True)
+            for h in hooks: h.remove()
+            result = torch.eye(attn_maps[0].shape[-1])
+            for attn in attn_maps:
+                attn_avg = attn.mean(1) + torch.eye(attn.shape[-1])
+                attn_avg /= attn_avg.sum(dim=-1, keepdim=True)
+                result = torch.matmul(attn_avg[0], result)
+            return result[0, 1:]
 
-    for name, CAM in {"EigenCAM": EigenCAM, "KPCA-CAM": KPCA_CAM}.items():
-        try:
-            start = time.time()
-            cam = CAM(model=wrapped, target_layers=target_layers)
-            cam_map = cam(input_tensor=input_tensor)[0]
-            cam_img = show_cam_on_image(rgb_image, cam_map, use_rgb=True)
-            visuals[name] = cam_img
-            scores[name] = compute_focus_score(cam_map)
-            times[name] = round(time.time() - start, 2)
-        except Exception as e:
-            st.warning(f"{name} gagal: {e}")
-
-    def rollout_fn(pixel_values):
-        attn_maps = []
-        def hook(module, input, output): 
-            if isinstance(output, tuple): attn_maps.append(output[1].detach().cpu())
-
-        hooks = [layer.self_attn.register_forward_hook(hook) for layer in model.vision_model.encoder.layers]
-        with torch.no_grad(): _ = model.vision_model(pixel_values, output_attentions=True)
-        for h in hooks: h.remove()
-
-        result = torch.eye(attn_maps[0].shape[-1])
-        for attn in attn_maps:
-            attn_avg = attn.mean(1) + torch.eye(attn.shape[-1])
-            attn_avg /= attn_avg.sum(dim=-1, keepdim=True)
-            result = torch.matmul(attn_avg[0], result)
-        return result[0, 1:]
-
-    try:
-        start = time.time()
         rollout = rollout_fn(input_tensor)
         size = int(np.sqrt(rollout.shape[0]))
         rollout = rollout[:size**2].reshape(size, size).numpy()
-        rollout = (rollout - rollout.min()) / (rollout.max() - rollout.min() + 1e-8)
-        rollout_resized = cv2.resize(rollout, (rgb_image.shape[1], rgb_image.shape[0]))
-        visuals["Attention Rollout"] = show_cam_on_image(rgb_image, rollout_resized, use_rgb=True)
-        scores["Attention Rollout"] = compute_focus_score(rollout_resized)
-        times["Attention Rollout"] = round(time.time() - start, 2)
-    except Exception as e:
-        st.warning(f"Rollout gagal: {e}")
-
-    def forward_fn(x): return model.vision_model(x).last_hidden_state[:, 0, :].norm(dim=1)
-    try:
-        start = time.time()
+        cam_map = cv2.resize((rollout - rollout.min()) / (rollout.max() - rollout.min() + 1e-8), (image.width, image.height))
+    elif selected_cam == "Saliency Map":
+        def forward_fn(x): return model.vision_model(x).last_hidden_state[:, 0, :].norm(dim=1)
         sal = Saliency(forward_fn)
         sal_attr = sal.attribute(input_tensor)[0].cpu().permute(1, 2, 0).numpy()
-        sal_map = np.mean(np.abs(sal_attr), axis=-1)
-        sal_map = (sal_map - sal_map.min()) / (sal_map.max() - sal_map.min() + 1e-8)
-        visuals["Saliency Map"] = show_cam_on_image(rgb_image, sal_map, use_rgb=True)
-        scores["Saliency Map"] = compute_focus_score(sal_map)
-        times["Saliency Map"] = round(time.time() - start, 2)
-    except Exception as e:
-        st.warning(f"Saliency Map gagal: {e}")
+        cam_map = np.mean(np.abs(sal_attr), axis=-1)
+        cam_map = (cam_map - cam_map.min()) / (cam_map.max() - cam_map.min() + 1e-8)
 
-    return visuals, scores, times
+    cam_overlay = show_cam_on_image(rgb_image, cam_map, use_rgb=True)
+    st.image(cam_overlay, caption=f"Visualisasi: {selected_cam}", use_container_width=True)
 
-# ====== Main App ======
-uploaded = st.file_uploader("Unggah gambar (JPG/PNG/JPEG)", type=["jpg", "jpeg", "png", "webp"])
-img_path = "imgs/test2.jpeg" if uploaded is None else uploaded
-
-image = load_uploaded_image(img_path)
-st.image(image, caption="🖼️ Gambar yang Diunggah", width=400)
-
-if st.button("🎯 Hasilkan Caption & Penjelasan"):
-    progress_bar = st.progress(0)
-    progress_text = st.empty()
-    start_total = time.time()
-    progress_text.text("📄 Menghasilkan caption… (0%)")
-
-    # progress = st.progress(0, text="📄 Menghasilkan caption…")
-    caption, attention, inf_time = generate_caption(image)
-    progress_bar.progress(30)
-    progress_text.text("✅ Caption berhasil dihasilkan! (30%)")
-
-    # progress.progress(30, text="✅ Caption berhasil dihasilkan!")
-    st.success(f"\"{caption}\"")
-
-    input_tensor = transform_to_tensor(image)
-    progress_bar.progress(60)
-    progress_text.text("📊 Memproses visualisasi CAM… (60%)")
-    visuals, scores, vis_times = compute_visual_explanations(image, input_tensor, caption)
-    progress_bar.progress(100)
-    progress_text.text("✅ Semua proses selesai! (100%)")
-    total_time = round(time.time() - start_total, 2)
-
-    # progress.progress(60, text="📊 Memproses visualisasi CAM…")
-    # progress.progress(100, text="✅ Semua proses selesai!")
-
-# if st.button("🎯 Hasilkan Caption & Penjelasan"):
-#     with st.status("📄 Menghasilkan caption…", expanded=True) as status:
-#         caption, attention = generate_caption(image)
-#         st.write(f"✅ Caption berhasil dihasilkan!")
-#         st.success(f"\"{caption}\"")
-#         status.update(label="📊 Memproses visualisasi CAM…", state="running")
-#         input_tensor = transform_to_tensor(image)
-#         visuals, scores = compute_visual_explanations(image, input_tensor, caption)
-#         status.update(label="✅ Semua proses selesai!", state="complete")
-
-    st.markdown("### 🔍 Penjelasan Visual (CAM)")
-    st.markdown("Setiap metode menampilkan area penting dari gambar yang dipertimbangkan oleh model. Skor Fokus menunjukkan seberapa terpusat perhatian model terhadap bagian gambar yang spesifik.")
-
-    cols = st.columns(4)
-    for idx, (title, vis) in enumerate(visuals.items()):
-        with cols[idx % 4]:
-            st.image(vis, caption=f"{title}\nSkor Fokus: {scores.get(title, '-')}", use_container_width=True)
-
-    st.markdown("### 📊 Ringkasan Skor dan Waktu")
-    df_summary = {
-        "Metode": list(scores.keys()),
-        "Skor Fokus": list(scores.values()),
-        "Waktu (detik)": [vis_times[k] for k in scores.keys()]
-    }
-    st.dataframe(df_summary)
-
-    st.info(f"**Waktu Inference Caption:** {round(inf_time, 2)} detik\n\n**Total Waktu Seluruh Proses:** {total_time} detik")
-
-# ====== Sidebar Info ======
-st.sidebar.markdown("## ℹ️ Tentang X-Capindo")
-st.sidebar.info("""
-**X-Capindo** adalah aplikasi captioning berbasis BLIP (Salesforce) yang dilengkapi dengan penjelasan visual melalui CAM (Class Activation Maps) dan attention transformer.
-
-**Langkah-langkah**:
-1. Unggah gambar yang ingin dideskripsikan.
-2. Klik *Hasilkan Caption*.
-3. Lihat caption dan peta atensi model.
-
-**Skor Fokus** adalah nilai antara 0 dan 1 yang mengukur apakah perhatian model tersebar atau terfokus. Nilai tinggi berarti fokus tinggi.
-
-**Waktu inference** dan **waktu visualisasi per metode** juga ditampilkan untuk memahami performa.
-🔗 Model aktif: `{model_choice}`
-""")
+# --- Navigation Buttons ---
+b_prev, _, b_next = st.columns([1, 6, 1])
+if b_prev.button("◄ Sebelumnya") and st.session_state.current_step > 0:
+    st.session_state.current_step -= 1
+    st.rerun()
+if b_next.button("Berikutnya ►") and st.session_state.current_step < len(steps) - 1:
+    st.session_state.current_step += 1
+    st.rerun()

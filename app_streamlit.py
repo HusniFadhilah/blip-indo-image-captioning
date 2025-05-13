@@ -17,12 +17,12 @@ from huggingface_hub import snapshot_download
 
 # ====== Konfigurasi ======
 device = "cuda" if torch.cuda.is_available() else "cpu"
-st.set_page_config(page_title="X-Capindo", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="X-Capindo", page_icon="imgs/logo.png", layout="wide")
 
 # ====== Header & Logo ======
 col1, col2 = st.columns([1, 8])
 with col1:
-    st.image("imgs/logo.png", width=90)
+    st.image("imgs/logo.png", width=90)  # Logo diganti di sini
 with col2:
     st.title("X-Capindo – Captioning dan Eksplorasi Fokus Gambar Berbahasa Indonesia")
     st.markdown("""
@@ -31,19 +31,26 @@ with col2:
     Setiap peta atensi disertai *Skor Fokus*, yang menunjukkan seberapa terfokus perhatian model terhadap objek penting.
     """)
 
-# ====== Load Model Lokal ======
+# ====== Load Model Lokal atau dari Huggingface ======
 @st.cache_resource
-def load_blip_model(is_local=False):
-    if is_local:
+def load_blip_model(model_choice):
+    if model_choice == "BLIP-Base (local)":
+        model_path = r"models/blip-image-captioning-base/v1.0"
+    elif model_choice == "BLIP-Large (local)":
         model_path = r"models/blip-image-captioning-large/v1.0"
-    else:
+    elif model_choice == "BLIP-Large (HF Hub)":
         model_path = snapshot_download(repo_id=r"HusniFd/blip-image-captioning-large")
-    
+    elif model_choice == "BLIP-Base (HF Hub)":
+        model_path = snapshot_download(repo_id=r"HusniFd/blip-image-captioning-base")
+    else:
+        raise ValueError("Model tidak dikenali.")
     processor = BlipProcessor.from_pretrained(model_path)
     model = BlipForConditionalGeneration.from_pretrained(model_path).to(device)
     return processor, model
 
-processor, model = load_blip_model()
+# ====== Pilih Model ======
+model_choice = st.selectbox("Pilih Model Captioning:", ["BLIP-Large (HF Hub)", "BLIP-Base (HF Hub)","BLIP-Base (local)","BLIP-Large (local)"])
+processor, model = load_blip_model(model_choice)
 
 # ====== Utilitas Gambar ======
 @st.cache_data
@@ -67,15 +74,13 @@ def generate_caption(image):
 
     handle = model.vision_model.encoder.layers[-1].self_attn.register_forward_hook(hook)
 
-    start = time.time()
     with torch.no_grad():
         output_ids = model.generate(**inputs)
-    inference_time = time.time() - start
 
     handle.remove()
     caption = processor.decode(output_ids[0], skip_special_tokens=True)
     attention = attention_maps[0][0].cpu().detach().numpy().mean(axis=1) if attention_maps else None
-    return caption, attention, inference_time
+    return caption, attention
 
 # ====== Skor Fokus ======
 def compute_focus_score(attn_map):
@@ -104,13 +109,11 @@ def compute_visual_explanations(image_pil, input_tensor, caption):
 
     for name, CAM in {"EigenCAM": EigenCAM, "KPCA-CAM": KPCA_CAM}.items():
         try:
-            start = time.time()
             cam = CAM(model=wrapped, target_layers=target_layers)
             cam_map = cam(input_tensor=input_tensor)[0]
             cam_img = show_cam_on_image(rgb_image, cam_map, use_rgb=True)
             visuals[name] = cam_img
             scores[name] = compute_focus_score(cam_map)
-            times[name] = round(time.time() - start, 2)
         except Exception as e:
             st.warning(f"{name} gagal: {e}")
 
@@ -131,7 +134,6 @@ def compute_visual_explanations(image_pil, input_tensor, caption):
         return result[0, 1:]
 
     try:
-        start = time.time()
         rollout = rollout_fn(input_tensor)
         size = int(np.sqrt(rollout.shape[0]))
         rollout = rollout[:size**2].reshape(size, size).numpy()
@@ -139,42 +141,61 @@ def compute_visual_explanations(image_pil, input_tensor, caption):
         rollout_resized = cv2.resize(rollout, (rgb_image.shape[1], rgb_image.shape[0]))
         visuals["Attention Rollout"] = show_cam_on_image(rgb_image, rollout_resized, use_rgb=True)
         scores["Attention Rollout"] = compute_focus_score(rollout_resized)
-        times["Attention Rollout"] = round(time.time() - start, 2)
     except Exception as e:
         st.warning(f"Rollout gagal: {e}")
 
     def forward_fn(x): return model.vision_model(x).last_hidden_state[:, 0, :].norm(dim=1)
     try:
-        start = time.time()
         sal = Saliency(forward_fn)
         sal_attr = sal.attribute(input_tensor)[0].cpu().permute(1, 2, 0).numpy()
         sal_map = np.mean(np.abs(sal_attr), axis=-1)
         sal_map = (sal_map - sal_map.min()) / (sal_map.max() - sal_map.min() + 1e-8)
         visuals["Saliency Map"] = show_cam_on_image(rgb_image, sal_map, use_rgb=True)
         scores["Saliency Map"] = compute_focus_score(sal_map)
-        times["Saliency Map"] = round(time.time() - start, 2)
     except Exception as e:
         st.warning(f"Saliency Map gagal: {e}")
 
-    return visuals, scores, times
+    return visuals, scores
 
 # ====== Main App ======
 uploaded = st.file_uploader("Unggah gambar (JPG/PNG/JPEG)", type=["jpg", "jpeg", "png", "webp"])
 img_path = "imgs/test2.jpeg" if uploaded is None else uploaded
 
 image = load_uploaded_image(img_path)
-st.image(image, caption="🖼️ Gambar yang Diunggah", width=400)  # Ukuran diperkecil
+st.image(image, caption="🖼️ Gambar yang Diunggah", width=400)
 
 if st.button("🎯 Hasilkan Caption & Penjelasan"):
-    with st.spinner("Menghasilkan caption dan menjelaskan fokus model..."):
-        start_total = time.time()
-        caption, attention, inf_time = generate_caption(image)
-        input_tensor = transform_to_tensor(image)
-        visuals, scores, vis_times = compute_visual_explanations(image, input_tensor, caption)
-        total_time = round(time.time() - start_total, 2)
+    progress_bar = st.progress(0)
+    progress_text = st.empty()
+    progress_text.text("📄 Menghasilkan caption… (0%)")
 
-    st.markdown(f"### 📾 Caption Hasil Generasi:")
+    # progress = st.progress(0, text="📄 Menghasilkan caption…")
+    caption, attention = generate_caption(image)
+    progress_bar.progress(30)
+    progress_text.text("✅ Caption berhasil dihasilkan! (30%)")
+
+    # progress.progress(30, text="✅ Caption berhasil dihasilkan!")
     st.success(f"\"{caption}\"")
+
+    input_tensor = transform_to_tensor(image)
+    progress_bar.progress(60)
+    progress_text.text("📊 Memproses visualisasi CAM… (60%)")
+    visuals, scores = compute_visual_explanations(image, input_tensor, caption)
+    progress_bar.progress(100)
+    progress_text.text("✅ Semua proses selesai! (100%)")
+
+    # progress.progress(60, text="📊 Memproses visualisasi CAM…")
+    # progress.progress(100, text="✅ Semua proses selesai!")
+
+# if st.button("🎯 Hasilkan Caption & Penjelasan"):
+#     with st.status("📄 Menghasilkan caption…", expanded=True) as status:
+#         caption, attention = generate_caption(image)
+#         st.write(f"✅ Caption berhasil dihasilkan!")
+#         st.success(f"\"{caption}\"")
+#         status.update(label="📊 Memproses visualisasi CAM…", state="running")
+#         input_tensor = transform_to_tensor(image)
+#         visuals, scores = compute_visual_explanations(image, input_tensor, caption)
+#         status.update(label="✅ Semua proses selesai!", state="complete")
 
     st.markdown("### 🔍 Penjelasan Visual (CAM)")
     st.markdown("Setiap metode menampilkan area penting dari gambar yang dipertimbangkan oleh model. Skor Fokus menunjukkan seberapa terpusat perhatian model terhadap bagian gambar yang spesifik.")
@@ -182,17 +203,7 @@ if st.button("🎯 Hasilkan Caption & Penjelasan"):
     cols = st.columns(4)
     for idx, (title, vis) in enumerate(visuals.items()):
         with cols[idx % 4]:
-            st.image(vis, caption=f"{title}\nSkor Fokus: {scores.get(title, '-')} | Waktu: {vis_times.get(title, '-')}s", use_container_width=True)
-
-    st.markdown("### 📊 Ringkasan Skor dan Waktu")
-    df_summary = {
-        "Metode": list(scores.keys()),
-        "Skor Fokus": list(scores.values()),
-        "Waktu (detik)": [vis_times[k] for k in scores.keys()]
-    }
-    st.dataframe(df_summary)
-
-    st.info(f"**Waktu Inference Caption:** {round(inf_time, 2)} detik\n\n**Total Waktu Seluruh Proses:** {total_time} detik")
+            st.image(vis, caption=f"{title}\nSkor Fokus: {scores.get(title, '-')}", use_container_width=True)
 
 # ====== Sidebar Info ======
 st.sidebar.markdown("## ℹ️ Tentang X-Capindo")
@@ -206,7 +217,5 @@ st.sidebar.info("""
 
 **Skor Fokus** adalah nilai antara 0 dan 1 yang mengukur apakah perhatian model tersebar atau terfokus. Nilai tinggi berarti fokus tinggi.
 
-**Waktu inference** dan **waktu visualisasi per metode** juga ditampilkan untuk memahami performa.
-
-🔗 Model: `blip-image-captioning-large`
+🔗 Model aktif: `{model_choice}`
 """)

@@ -56,7 +56,7 @@ with st.sidebar.expander("ℹ️ Tentang X-Capindo", expanded=True):
 
 # --- Model Load (once) ---
 @st.cache_resource
-def load_model(model_choice="BLIP-Base (local)"):
+def load_model(model_choice="BLIP-Large (HF Hub)"):
     if model_choice == "BLIP-Base (local)":
         model_path = r"models/blip-image-captioning-base/v1.0"
     elif model_choice == "BLIP-Large (local)":
@@ -440,7 +440,7 @@ if st.session_state.current_step == 1:
         rgb_image = (rgb_image - rgb_image.min()) / (rgb_image.max() - rgb_image.min() + 1e-8)
 
         # 🔻 Resize jika terlalu besar
-        max_dim = 512
+        max_dim = 128
         h, w = rgb_image.shape[:2]
         if max(h, w) > max_dim:
             scale = max_dim / max(h, w)

@@ -37,7 +37,7 @@ with st.sidebar.expander("ℹ️ Tentang X-Capindo", expanded=True):
     st.image("imgs/logo.png", width=90)
     model_option = st.selectbox(
         "🔧 Pilih Model BLIP",
-        ["BLIP-Base (local)", "BLIP-Large (local)", "BLIP-Base (HF Hub)", "BLIP-Large (HF Hub)"],
+        ["BLIP-Large (local)", "BLIP-Base (local)", "BLIP-Base (HF Hub)", "BLIP-Large (HF Hub)"],
         key="model_selection"
     )
     st.markdown("""

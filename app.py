@@ -8,6 +8,7 @@ import io, math, time
 import torch.nn as nn
 from PIL import Image, ImageOps
 from collections import Counter
+from huggingface_hub import snapshot_download
 from pytorch_grad_cam import EigenCAM, KPCA_CAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from captum.attr import Saliency, LayerGradCam, LayerAttribution

@@ -34,6 +34,11 @@ st.markdown('<div class="sub-header">Pelajari tahapan bagaimana AI menghasilkan 
 # --- Sidebar Info ---
 with st.sidebar.expander("ℹ️ Tentang X-Capindo", expanded=True):
     st.image("imgs/logo.png", width=90)
+    model_option = st.selectbox(
+        "🔧 Pilih Model BLIP",
+        ["BLIP-Base (local)", "BLIP-Large (local)", "BLIP-Base (HF Hub)", "BLIP-Large (HF Hub)"],
+        key="model_selection"
+    )
     st.markdown("""
 **X-Capindo** adalah aplikasi captioning berbasis BLIP (Salesforce) yang dilengkapi dengan penjelasan visual melalui CAM (Class Activation Maps), attention transformer, dan feature map.
 
@@ -45,7 +50,7 @@ with st.sidebar.expander("ℹ️ Tentang X-Capindo", expanded=True):
 5. Dapatkan caption akhir.
     """)
     st.markdown("""
-**Model**: BLIP (Base) – `Salesforce/blip-image-captioning-base`
+**Model**: BLIP (Base/Large) – `Salesforce/blip-image-captioning`
 
 **Teknik XAI**:
 - EigenCAM / KPCA-CAM
@@ -56,11 +61,13 @@ with st.sidebar.expander("ℹ️ Tentang X-Capindo", expanded=True):
 
 # --- Model Load (once) ---
 @st.cache_resource
-def load_model(model_choice="BLIP-Large (HF Hub)"):
+def load_model(model_choice="BLIP-Large (local)"):
     if model_choice == "BLIP-Base (local)":
-        model_path = r"models/blip-image-captioning-base/v1.0"
+        model_path = snapshot_download(repo_id=r"HusniFd/blip-image-captioning-base")
+        # model_path = r"models/blip-image-captioning-base/v1.0"
     elif model_choice == "BLIP-Large (local)":
-        model_path = r"models/blip-image-captioning-large/v1.0"
+        model_path = snapshot_download(repo_id=r"HusniFd/blip-image-captioning-large")
+        # model_path = r"models/blip-image-captioning-large/v1.0"
     elif model_choice == "BLIP-Large (HF Hub)":
         model_path = snapshot_download(repo_id=r"HusniFd/blip-image-captioning-large")
     elif model_choice == "BLIP-Base (HF Hub)":
@@ -71,7 +78,7 @@ def load_model(model_choice="BLIP-Large (HF Hub)"):
     model = BlipForConditionalGeneration.from_pretrained(model_path).to(device)
     return processor, model
 
-processor, model = load_model()
+processor, model = load_model(st.session_state.get("model_selection", "BLIP-Large (local)"))
 
 # --- Image Upload Helper ---
 @st.cache_data
@@ -263,7 +270,7 @@ def summarize_model_colored(model: nn.Module, max_depth=2):
 # --- Step logic ---
 steps = [
     {"title": "Unggah Gambar", "description": "Sistem menerima gambar dari pengguna", "tech_details": "Gambar diubah menjadi tensor 3-channel dengan normalisasi dan penskalaan untuk digunakan model."},
-    {"title": "Peta Aktivasi (CAM)", "description": "Visualisasi fokus model pada gambar", "tech_details": "Menggunakan teknik explainability: EigenCAM, KPCA-CAM, Attention Rollout, dan Saliency Map untuk menampilkan area penting yang diproses model."},
+    {"title": "Peta Aktivasi (CAM)", "description": "Visualisasi fokus model pada gambar", "tech_details": "Menggunakan teknik explainability: KPCA-CAM, EigenCAM, Attention Rollout, dan Saliency Map untuk menampilkan area penting yang diproses model."},
     {"title": "Feature Map", "description": "Ekstraksi dan visualisasi saluran fitur dari encoder", "tech_details": "Menampilkan 16 channel awal dari token visual BLIP (tanpa CLS), disusun dalam grid 4x4 sebagai representasi patch embedding."},
     # {"title": "Cross-Attention per Kata", "description": "Visualisasi atensi model terhadap setiap kata yang dihasilkan", "tech_details": "Membandingkan peta atensi cross-attention decoder dengan hasil Grad-CAM untuk setiap token dalam caption."},
 ]
@@ -346,7 +353,7 @@ if st.session_state.current_step == 1:
     st.subheader("🔍 Pilih Teknik Visualisasi Fokus Gambar")
     selected_cam = st.selectbox(
         "Metode Explainability", 
-        ["EigenCAM", "KPCA-CAM", "Attention Rollout", "Saliency Map"]
+        ["KPCA-CAM", "EigenCAM", "Attention Rollout", "Saliency Map"]
     )
 
     image = st.session_state.image or load_uploaded_image("imgs/test5.jpg")

@@ -1,16 +1,17 @@
 # Streamlit Wizard for BLIP Image Captioning – Updated with CAM & Cross-Attention
 import streamlit as st
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import numpy as np
-import cv2
-import torch
+import cv2, torch, torchvision, graphviz
+import io, math, time
+import torch.nn as nn
 from PIL import Image, ImageOps
+from collections import Counter
 from pytorch_grad_cam import EigenCAM, KPCA_CAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from captum.attr import Saliency, LayerGradCam, LayerAttribution
-import torchvision
 from transformers import BlipProcessor, BlipForConditionalGeneration
-import io, math, time
 
 # --- Setup ---
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -155,7 +156,7 @@ def compare_attention_vs_gradcam(model, processor, pixel_values, input_ids, rgb_
     for idx, (word, gradcam_img) in enumerate(gradcam_images):
         r, c = divmod(idx, max_cols)
         axes[r, c].imshow(gradcam_img)
-        axes[r, c].set_title(f"{word}", fontsize=9)
+        axes[r, c].set_title(f"{word}", fontsize=12)
         axes[r, c].axis("off")
 
     # Kosongkan sisa kolom di akhir baris terakhir
@@ -166,19 +167,112 @@ def compare_attention_vs_gradcam(model, processor, pixel_values, input_ids, rgb_
     plt.tight_layout()
     return fig
 
+def draw_blip_architecture():
+    graph = graphviz.Digraph(format='png')
+    graph.attr(rankdir='LR', size='10')
+
+    # Root
+    graph.node("BLIP", "BlipForConditionalGeneration", shape='box', style='filled', fillcolor='lightblue')
+
+    # Vision Branch
+    graph.node("Vision", "BlipVisionModel", shape='box', style='filled', fillcolor='lightblue')
+    graph.edge("BLIP", "Vision")
+
+    graph.node("PatchEmb", "patch_embedding\nConv2d(3→1024)", shape='box', fillcolor='lightyellow', style='filled')
+    graph.node("Encoder", "BlipEncoder", shape='box', fillcolor='lightyellow', style='filled')
+    graph.node("Layers", "24 x BlipEncoderLayer", shape='box', fillcolor='lightyellow', style='filled')
+    graph.node("SelfAttn", "self_attn\nqkv(1024→3072)", shape='box', fillcolor='lightgray', style='filled')
+    graph.node("MLP", "mlp\n1024→4096→1024", shape='box', fillcolor='lightgray', style='filled')
+
+    graph.edge("Vision", "PatchEmb")
+    graph.edge("PatchEmb", "Encoder")
+    graph.edge("Encoder", "Layers")
+    graph.edge("Layers", "SelfAttn")
+    graph.edge("Layers", "MLP")
+
+    # Text Branch
+    graph.node("Text", "BlipTextLMHeadModel", shape='box', style='filled', fillcolor='lightblue')
+    graph.edge("BLIP", "Text")
+
+    graph.node("TextModel", "BlipTextModel", shape='box', fillcolor='lightyellow', style='filled')
+    graph.node("TextEmb", "Text Embeddings\n(word + pos)", shape='box', fillcolor='lightgray', style='filled')
+    graph.node("TextEnc", "BlipTextEncoder", shape='box', fillcolor='lightyellow', style='filled')
+    graph.node("TxtLayer", "12 x BlipTextLayer", shape='box', fillcolor='lightyellow', style='filled')
+    graph.node("SelfTxt", "self_attention\n768→768", shape='box', fillcolor='lightgray', style='filled')
+    graph.node("CrossAttn", "cross_attention\n1024→768", shape='box', fillcolor='lightgray', style='filled')
+
+    graph.edge("Text", "TextModel")
+    graph.edge("TextModel", "TextEmb")
+    graph.edge("TextModel", "TextEnc")
+    graph.edge("TextEnc", "TxtLayer")
+    graph.edge("TxtLayer", "SelfTxt")
+    graph.edge("TxtLayer", "CrossAttn")
+
+    return graph
+
+def summarize_model_colored(model: nn.Module, max_depth=2):
+    lines = []
+
+    def recurse(module, prefix="", depth=0):
+        if depth > max_depth:
+            return
+
+        # Hitung modul berulang pada level ini
+        child_types = [child.__class__.__name__ for _, child in module.named_children()]
+        counter = Counter(child_types)
+
+        # Lacak indeks per jenis untuk menghitung jumlahnya
+        handled = set()
+        for name, child in module.named_children():
+            class_name = child.__class__.__name__
+            if class_name in handled:
+                continue  # Sudah diringkas
+
+            same_type_children = [(n, c) for n, c in module.named_children() if c.__class__.__name__ == class_name]
+
+            # Pilih warna
+            if depth == 0:
+                color = "dodgerblue"
+            elif depth == 1:
+                color = "mediumseagreen"
+            elif depth == 2:
+                color = "darkorange"
+            else:
+                color = "gray"
+
+            if len(same_type_children) > 3:  # threshold untuk diringkas
+                count = len(same_type_children)
+                line = f"{prefix}├─ <span style='color:{color}'><b>{count}x {class_name}</b></span>"
+                lines.append(line)
+                handled.add(class_name)
+                # Rekursi hanya pada satu anak untuk representasi struktur
+                recurse(same_type_children[0][1], prefix + "│&nbsp;&nbsp;&nbsp;", depth + 1)
+            else:
+                # Tampilkan masing-masing
+                shape_info = ""
+                if hasattr(child, 'weight') and hasattr(child.weight, 'shape'):
+                    shape_info = f" <span style='color:gray'>({tuple(child.weight.shape)})</span>"
+                line = f"{prefix}├─ <span style='color:{color}'><b>{name}: {class_name}</b></span>{shape_info}"
+                lines.append(line)
+                recurse(child, prefix + "│&nbsp;&nbsp;&nbsp;", depth + 1)
+                handled.add(class_name)
+
+    recurse(model)
+    return "<div style='font-family:monospace; font-size:13px;'>" + "<br>".join(lines) + "</div>"
+
 # --- Step logic ---
 steps = [
     {"title": "Unggah Gambar", "description": "Sistem menerima gambar dari pengguna", "tech_details": "Gambar diubah menjadi tensor 3-channel dengan normalisasi dan penskalaan untuk digunakan model."},
     {"title": "Peta Aktivasi (CAM)", "description": "Visualisasi fokus model pada gambar", "tech_details": "Menggunakan teknik explainability: EigenCAM, KPCA-CAM, Attention Rollout, dan Saliency Map untuk menampilkan area penting yang diproses model."},
     {"title": "Feature Map", "description": "Ekstraksi dan visualisasi saluran fitur dari encoder", "tech_details": "Menampilkan 16 channel awal dari token visual BLIP (tanpa CLS), disusun dalam grid 4x4 sebagai representasi patch embedding."},
-    {"title": "Cross-Attention per Kata", "description": "Visualisasi atensi model terhadap setiap kata yang dihasilkan", "tech_details": "Membandingkan peta atensi cross-attention decoder dengan hasil Grad-CAM untuk setiap token dalam caption."},
+    # {"title": "Cross-Attention per Kata", "description": "Visualisasi atensi model terhadap setiap kata yang dihasilkan", "tech_details": "Membandingkan peta atensi cross-attention decoder dengan hasil Grad-CAM untuk setiap token dalam caption."},
 ]
 
 # --- Session state init ---
 if "current_step" not in st.session_state:
     st.session_state.current_step = 0
 if "image" not in st.session_state:
-    st.session_state.image = load_uploaded_image("imgs/test5.jpg")
+    st.session_state.image = load_uploaded_image("imgs/test.jpg")
 
 for i in range(len(steps)):
     step_key = f"step_{i}_done"
@@ -226,6 +320,7 @@ if st.session_state.current_step == 0:
 
     with torch.no_grad():
         gen_output = model.generate(**inputs, return_dict_in_generate=True, output_scores=True)
+        st.session_state.gen_output = gen_output
         output_ids = gen_output.sequences
         caption = processor.decode(output_ids[0], skip_special_tokens=True)
 
@@ -237,6 +332,13 @@ if st.session_state.current_step == 0:
     progress_text.text(f"✅ Caption dihasilkan dalam {total_time} detik")
 
     st.success(f"📄 Caption yang Dihasilkan: \"{caption}\"")
+
+    with st.expander("📊 Tampilkan Arsitektur BLIP"):
+        st.graphviz_chart(draw_blip_architecture())
+
+    with st.expander("📄 Arsitektur Model BLIP"):
+        html_summary = summarize_model_colored(model, max_depth=3)
+        st.markdown(html_summary, unsafe_allow_html=True)
     st.session_state.step_1_done = True
 
 # --- Step 2: Visualisasi CAM ---
@@ -248,7 +350,7 @@ if st.session_state.current_step == 1:
     )
 
     image = st.session_state.image or load_uploaded_image("imgs/test5.jpg")
-    input_tensor = processor(images=image, return_tensors="pt", truncation=True).pixel_values.to(device)
+    input_tensor = st.session_state.inputs['pixel_values']
     rgb_image = np.array(image).astype(np.float32) / 255.0
 
     # === Siapkan untuk CAM global
@@ -312,6 +414,92 @@ if st.session_state.current_step == 1:
     st.markdown("### 🌐 Visualisasi Global")
     st.image(cam_overlay, caption=f"{selected_cam} (waktu: {elapsed} detik)", width=320)  # Lebih ramping
 
+    st.markdown("### 🎯 Visualisasi Cross-Attention dari Decoder")
+
+    with torch.no_grad():
+        pixel_values = st.session_state.inputs["pixel_values"]
+        vision_outputs = model.vision_model(pixel_values=pixel_values)
+        image_embeds = vision_outputs.last_hidden_state
+
+        output_ids = st.session_state.generated_ids
+        input_ids = output_ids.unsqueeze(0) if output_ids.dim() == 1 else output_ids
+
+        decoder_outputs = model.text_decoder.bert(
+            input_ids=input_ids,
+            encoder_hidden_states=image_embeds,
+            encoder_attention_mask=None,
+            output_attentions=True,
+            return_dict=True,
+        )
+        cross_att = decoder_outputs.attentions  # List[len_layer] of (B, heads, seq_len, num_patches+1)
+
+        tokens = processor.tokenizer.convert_ids_to_tokens(input_ids[0])
+        words, indices = reconstruct_words_and_indices(tokens)
+
+        rgb_image = pixel_values[0].permute(1, 2, 0).detach().cpu().numpy()
+        rgb_image = (rgb_image - rgb_image.min()) / (rgb_image.max() - rgb_image.min() + 1e-8)
+
+        # 🔻 Resize jika terlalu besar
+        max_dim = 512
+        h, w = rgb_image.shape[:2]
+        if max(h, w) > max_dim:
+            scale = max_dim / max(h, w)
+            rgb_image = cv2.resize(rgb_image, (int(w * scale), int(h * scale)))
+
+        cross_images = []
+
+        for word, idx_list in zip(words, indices):
+            token_idx = idx_list[-1]
+            attn_heads = cross_att[-1][0, :, token_idx, :][:, 1:]  # remove CLS
+            best_head = torch.argmax(attn_heads.mean(1)).item()
+            attn_map = attn_heads[best_head]
+            attn_len = attn_map.shape[-1]
+            side = int(attn_len ** 0.5)
+
+            if side * side != attn_len:
+                new_len = (side + 1) ** 2
+                pad_len = new_len - attn_len
+                attn_map = F.pad(attn_map, (0, pad_len), value=0)
+                side = int(attn_map.shape[-1] ** 0.5)
+
+            attn_img = attn_map.reshape(side, side).detach().cpu().numpy()
+            attn_img = (attn_img - attn_img.min()) / (attn_img.max() - attn_img.min() + 1e-8)
+
+            attn_overlay = show_cam_on_image(
+                rgb_image.copy(),
+                cv2.resize(attn_img, (rgb_image.shape[1], rgb_image.shape[0])),
+                use_rgb=True
+            )
+
+            cross_images.append((word, attn_overlay))
+
+    # ===== Plot sebagai grid horizontal seperti Grad-CAM =====
+    if cross_images:
+        max_cols = 5
+        rows = int(np.ceil(len(cross_images) / max_cols))
+        fig, axes = plt.subplots(rows, max_cols, figsize=(3 * max_cols, 3 * rows))
+
+        if rows == 1:
+            axes = np.expand_dims(axes, 0)
+        if max_cols == 1:
+            axes = np.expand_dims(axes, 1)
+
+        for idx, (word, overlay_img) in enumerate(cross_images):
+            r, c = divmod(idx, max_cols)
+            axes[r, c].imshow(overlay_img)
+            axes[r, c].set_title(f"{word}", fontsize=10)
+            axes[r, c].axis("off")
+
+        # Kosongkan sisa slot
+        for idx in range(len(cross_images), rows * max_cols):
+            r, c = divmod(idx, max_cols)
+            axes[r, c].axis("off")
+
+        plt.tight_layout()
+        st.pyplot(fig)
+    else:
+        st.info("ℹ️ Tidak ada token yang dapat divisualisasikan karena ukuran attention map tidak bisa direstrukturisasi menjadi persegi.")
+
     # === Grad-CAM Eksklusif untuk per Kata
     st.markdown("### 🧠 Grad-CAM per Kata")
     with st.spinner("🔍 Menghitung Grad-CAM tiap kata..."):
@@ -330,110 +518,164 @@ if st.session_state.current_step == 1:
         st.warning("⚠️ Gagal menampilkan Grad-CAM per kata.")
 
 # --- Step 3: Feature Map ---
-# if st.session_state.current_step == 2 and st.session_state.image:
-if st.session_state.current_step == 2:
-    st.subheader("🔬 Visualisasi Feature Map dari Encoder BLIP")
+if st.session_state.current_step == 2 and st.session_state.image:
+# if st.session_state.current_step == 2:
+    st.subheader("🔍 Analisis Feature Map")
 
+    # Ambil tensor gambar
     image = st.session_state.image
-    input_tensor = processor(images=image, return_tensors="pt", truncation=True).pixel_values.to(device)
+    input_tensor = st.session_state.inputs['pixel_values']
 
+    # Dapatkan feature map dari encoder
     with torch.no_grad():
         outputs = model.vision_model(pixel_values=input_tensor)
         feature_map = outputs.last_hidden_state[:, 1:, :]  # exclude CLS
 
-    num_patches = feature_map.shape[1]
-    h, w = factorize(num_patches)  # ganti dari int(sqrt(...))
-    if h * w != num_patches:
-        st.warning("⚠️ Jumlah patch tidak bisa diubah menjadi grid 2D. Coba dengan gambar resolusi lain.")
-    else:
-        feature_map = feature_map[0].permute(1, 0).reshape(-1, h, w).detach().cpu()
+        num_patches = feature_map.shape[1]
+        h, w = factorize(num_patches)
 
-        col1, col2 = st.columns([1, 4])
-        with col1:
-            selected = st.slider("Channel", 0, feature_map.shape[0] - 1, 0, 1)
-        with col2:
-            st.write(f"Menampilkan Feature Map - Channel #{selected}")
-            fig, ax = plt.subplots(figsize=(6, 6))
-            ax.imshow(feature_map[selected], cmap="viridis")
-            ax.axis("off")
-            st.pyplot(fig)
+        if h * w != num_patches:
+            st.warning("⚠️ Jumlah patch tidak bisa diubah menjadi grid 2D. Coba dengan gambar resolusi lain.")
+        else:
+            feature_map = feature_map[0].permute(1, 0).reshape(-1, h, w).detach().cpu()
+
+            # Buat dua kolom dalam satu baris
+            col_left, col_right = st.columns([2, 5])  # kiri lebih kecil
+
+            # Kolom Kiri: Slider + 1 Feature Map
+            with col_left:
+                st.markdown("### 🧩 Feature Map Tunggal")
+                selected = st.slider("Channel", 0, feature_map.shape[0] - 1, 0, 1)
+                st.caption(f"Channel #{selected}")
+                fig_feat, ax_feat = plt.subplots(figsize=(4, 4))
+                ax_feat.imshow(feature_map[selected], cmap="viridis")
+                ax_feat.axis("off")
+                st.pyplot(fig_feat)
+
+            # Kolom Kanan: Grid Feature Map 16 channel pertama
+            with col_right:
+                st.markdown("### 🧩 Grid 16 Feature Maps Pertama")
+
+                fig_grid, axs = plt.subplots(4, 4, figsize=(8, 8))
+                for i in range(16):
+                    row, col = divmod(i, 4)
+                    axs[row, col].imshow(feature_map[i], cmap="viridis")
+                    axs[row, col].set_title(f"#{i}", fontsize=8)
+                    axs[row, col].axis("off")
+
+                plt.tight_layout()
+                st.pyplot(fig_grid)
+
+    st.markdown("### 📈 Probabilitas Token (Confidence per Kata)")
+
+    gen_output = st.session_state.gen_output
+    output_ids = st.session_state.generated_ids[0]
+    scores = gen_output.scores
+
+    tokens = processor.tokenizer.convert_ids_to_tokens(output_ids)
+    probs = [F.softmax(score[0], dim=-1) for score in scores]
+    selected_probs = [p[output_ids[i+1]].item() for i, p in enumerate(probs)]  # skip BOS token
+
+    # Gabungkan sub-token
+    words, indices = reconstruct_words_and_indices(tokens[1:])  # skip BOS
+
+    word_probs = []
+    for idx_list in indices:
+        if all(i < len(selected_probs) for i in idx_list):
+            avg_prob = sum([selected_probs[i] for i in idx_list]) / len(idx_list)
+            word_probs.append(avg_prob)
+
+    fig_score, ax_score = plt.subplots(figsize=(8, 3))
+    bars = ax_score.bar(words, word_probs)
+    ax_score.set_ylabel("Probabilitas")
+    ax_score.set_ylim(0, 1.05)
+    ax_score.set_title("Confidence per Kata Output")
+
+    for bar, prob in zip(bars, word_probs):
+        height = bar.get_height()
+        ax_score.annotate(f"{prob:.2f}", xy=(bar.get_x() + bar.get_width() / 2, height),
+                        xytext=(0, 3), textcoords="offset points",
+                        ha='center', va='bottom', fontsize=8)
+
+    st.pyplot(fig_score)
 
 # --- Step 4: Cross-Attention ---
-if st.session_state.current_step == 3:
+# if st.session_state.current_step == 3:
 # if st.session_state.current_step == 3 and st.session_state.image:
-    st.subheader("🎯 Visualisasi Cross-Attention dan Grad-CAM")
+#     st.subheader("🎯 Visualisasi Cross-Attention dan Grad-CAM")
 
-    image = st.session_state.image
-    pixel_values = processor(images=image, return_tensors="pt", truncation=True).pixel_values
+#     image = st.session_state.image
+#     inputs = st.session_state.inputs
+#     pixel_values = inputs["pixel_values"]
+#     input_ids = st.session_state.generated_ids
 
-    with torch.no_grad():
-        vision_outputs = model.vision_model(pixel_values=pixel_values)
-        image_embeds = vision_outputs.last_hidden_state
+#     with torch.no_grad():
+#         vision_outputs = model.vision_model(pixel_values=pixel_values)
+#         image_embeds = vision_outputs.last_hidden_state
+#         decoder_outputs = model.text_decoder.bert(
+#             input_ids=input_ids,
+#             encoder_hidden_states=image_embeds,
+#             encoder_attention_mask=None,
+#             output_attentions=True,
+#             return_dict=True,
+#         )
+#         cross_attentions = decoder_outputs.attentions
 
-        input_ids = processor(text="", return_tensors="pt").input_ids
-        decoder_outputs = model.text_decoder.bert(
-            input_ids=input_ids,
-            encoder_hidden_states=image_embeds,
-            encoder_attention_mask=None,
-            output_attentions=True,
-            return_dict=True,
-        )
-        cross_attentions = decoder_outputs.attentions
+#     token_ids = input_ids[0].tolist()
+#     token_strs = processor.tokenizer.convert_ids_to_tokens(token_ids)
 
-    token_ids = input_ids[0].tolist()
-    token_strs = processor.tokenizer.convert_ids_to_tokens(token_ids)
+#     words, indices = reconstruct_words_and_indices(token_strs)
+#     rgb_image = pixel_values[0].permute(1, 2, 0).numpy()
+#     rgb_image = (rgb_image - rgb_image.min()) / (rgb_image.max() - rgb_image.min())
 
-    def reconstruct_words(token_strs):
-        words, indices = [], []
-        current, idxs = "", []
-        for i, t in enumerate(token_strs):
-            if t.startswith("##"):
-                current += t[2:]; idxs.append(i)
-            else:
-                if current: words.append(current); indices.append(idxs)
-                current, idxs = t, [i]
-        if current: words.append(current); indices.append(idxs)
-        return words, indices
+#     fig, axes = plt.subplots(len(words), 2, figsize=(10, 4 * len(words)))
+#     if len(words) == 1:
+#         axes = np.expand_dims(axes, 0)
 
-    words, indices = reconstruct_words(token_strs)
-    rgb_image = pixel_values[0].permute(1, 2, 0).numpy()
-    rgb_image = (rgb_image - rgb_image.min()) / (rgb_image.max() - rgb_image.min())
+#     for i, (word, idx_list) in enumerate(zip(words, indices)):
+#         token_idx = idx_list[-1]
 
-    fig, axes = plt.subplots(len(words), 2, figsize=(10, 4 * len(words)))
-    if len(words) == 1:
-        axes = np.expand_dims(axes, 0)
+#         attn_heads = cross_attentions[-1][0, :, token_idx, :][:, 1:]  # hapus CLS
+#         best_head = torch.argmax(attn_heads.mean(1)).item()
+#         attn_map = attn_heads[best_head]
+#         attn_len = attn_map.shape[0]
+#         side = int(attn_len ** 0.5)
 
-    for i, (word, idx_list) in enumerate(zip(words, indices)):
-        token_idx = idx_list[-1]
-        attn_heads = cross_attentions[-1][0, :, token_idx, :][:, 1:]
-        best_head = torch.argmax(attn_heads.mean(1)).item()
-        attn_map = attn_heads[best_head]
-        h, w = int(attn_map.shape[0]**0.5), int(attn_map.shape[0]**0.5)
-        attn_img = attn_map.reshape(h, w).detach().cpu().numpy()
-        range_val = attn_img.max() - attn_img.min()
-        attn_img = (attn_img - attn_img.min()) / (range_val + 1e-8)
-        attn_overlay = show_cam_on_image(rgb_image, cv2.resize(attn_img, (rgb_image.shape[1], rgb_image.shape[0])), use_rgb=True)
+#         valid_attn = side * side == attn_len
+#         if valid_attn:
+#             attn_img = attn_map.reshape(side, side).detach().cpu().numpy()
+#             attn_img = (attn_img - attn_img.min()) / (attn_img.max() - attn_img.min() + 1e-8)
+#             attn_overlay = show_cam_on_image(
+#                 rgb_image,
+#                 cv2.resize(attn_img, (rgb_image.shape[1], rgb_image.shape[0])),
+#                 use_rgb=True
+#             )
+#         else:
+#             attn_overlay = np.ones_like(rgb_image)  # gambar putih
+#             attn_overlay[:] = [1, 1, 1]
 
-        def forward_fn(pix):
-            out = model(pixel_values=pix, input_ids=input_ids)
-            return out.logits[:, token_idx, :]
+#         # Grad-CAM
+#         def forward_fn(pix):
+#             out = model(pixel_values=pix, input_ids=input_ids)
+#             return out.logits[:, token_idx, :]
 
-        cam = LayerGradCam(forward_fn, model.vision_model.embeddings.patch_embedding)
-        attr = cam.attribute(pixel_values, target=token_ids[token_idx])
-        cam_map = LayerAttribution.interpolate(attr, pixel_values.shape[-2:])
-        cam_map = cam_map[0].mean(0).detach().cpu().numpy()
-        cam_map = (cam_map - cam_map.min()) / (cam_map.max() - cam_map.min())
-        cam_overlay = show_cam_on_image(rgb_image, cam_map, use_rgb=True)
+#         cam = LayerGradCam(forward_fn, model.vision_model.embeddings.patch_embedding)
+#         attr = cam.attribute(pixel_values, target=token_ids[token_idx])
+#         cam_map = LayerAttribution.interpolate(attr, pixel_values.shape[-2:])
+#         cam_map = cam_map[0].mean(0).detach().cpu().numpy()
+#         cam_map = (cam_map - cam_map.min()) / (cam_map.max() - cam_map.min())
+#         cam_overlay = show_cam_on_image(rgb_image, cam_map, use_rgb=True)
 
-        axes[i, 0].imshow(attn_overlay)
-        axes[i, 0].set_title(f"Cross-Attn '{word}'")
-        axes[i, 0].axis("off")
+#         axes[i, 0].imshow(attn_overlay)
+#         axes[i, 0].set_title(f"Cross-Attn '{word}'" + ("" if valid_attn else " ❌"))
+#         axes[i, 0].axis("off")
 
-        axes[i, 1].imshow(cam_overlay)
-        axes[i, 1].set_title(f"Grad-CAM '{word}'")
-        axes[i, 1].axis("off")
+#         axes[i, 1].imshow(cam_overlay)
+#         axes[i, 1].set_title(f"Grad-CAM '{word}'")
+#         axes[i, 1].axis("off")
 
-    st.pyplot(fig)
+#     plt.tight_layout()
+#     st.pyplot(fig)
 
 # --- Navigation Buttons ---
 b_prev, _, b_next = st.columns([1, 6, 1])

@@ -270,11 +270,56 @@ def summarize_model_colored(model: nn.Module, max_depth=2):
 
 # --- Step logic ---
 steps = [
-    {"title": "Unggah Gambar", "description": "Sistem menerima gambar dari pengguna", "tech_details": "Gambar diubah menjadi tensor 3-channel dengan normalisasi dan penskalaan untuk digunakan model."},
-    {"title": "Peta Aktivasi (CAM)", "description": "Visualisasi fokus model pada gambar", "tech_details": "Menggunakan teknik explainability: KPCA-CAM, EigenCAM, Attention Rollout, dan Saliency Map untuk menampilkan area penting yang diproses model."},
-    {"title": "Feature Map", "description": "Ekstraksi dan visualisasi saluran fitur dari encoder", "tech_details": "Menampilkan 16 channel awal dari token visual BLIP (tanpa CLS), disusun dalam grid 4x4 sebagai representasi patch embedding."},
-    # {"title": "Cross-Attention per Kata", "description": "Visualisasi atensi model terhadap setiap kata yang dihasilkan", "tech_details": "Membandingkan peta atensi cross-attention decoder dengan hasil Grad-CAM untuk setiap token dalam caption."},
+    {
+        "title": "Unggah Gambar",
+        "description": "Sistem menerima gambar dari pengguna",
+        "tech_details": """
+Gambar diubah menjadi tensor 3-channel dengan normalisasi dan penskalaan untuk digunakan model.
+Caption dihasilkan oleh BLIP menggunakan encoder-decoder vision-language transformer.
+        """
+    },
+    {
+        "title": "Peta Aktivasi (CAM)",
+        "description": "Visualisasi fokus model pada gambar",
+        "tech_details": """
+**Visualisasi Global Fokus Model (CAM):**
+- Gambar dikonversi ke tensor dan dinormalisasi.
+- Layer `patch_embedding` dari vision encoder dibungkus sebagai target Grad-CAM.
+- Berdasarkan metode terpilih (`EigenCAM`, `KPCA-CAM`, `Attention Rollout`, `Saliency Map`), dihitung peta aktivasi.
+- Peta CAM dinormalisasi dan di-overlay ke gambar untuk menampilkan area penting.
+- Waktu proses CAM juga ditampilkan.
+
+**🎯 Visualisasi Cross-Attention Decoder:**
+- Cross-attention diambil dari layer terakhir decoder (`cross_att = decoder_outputs.attentions[-1]`).
+- Untuk setiap token output, dipilih attention head terbaik.
+- Attention map dirubah ke format 2D dan ditumpangkan pada gambar input.
+- Menunjukkan bagian gambar yang paling diperhatikan saat menghasilkan kata tertentu.
+
+**🧠 Grad-CAM per Kata Output:**
+- Token output diubah menjadi kata dengan indeks token yang relevan.
+- Untuk setiap kata, dihitung peta aktivasi dari `patch_embedding` menggunakan `LayerGradCam`.
+- CAM dinormalisasi dan di-overlay ke gambar asli (`rgb_image`) per kata.
+- Semua hasil ditampilkan sebagai grid visual (per kata) untuk melihat area fokus visual terhadap token tertentu.
+        """
+    },
+    {
+        "title": "Feature Map",
+        "description": "Ekstraksi dan visualisasi saluran fitur dari encoder",
+        "tech_details": """
+**Analisis Feature Map:**
+- Mengambil feature map dari output vision encoder (tanpa token CLS).
+- 16 channel pertama divisualisasikan dalam grid 4x4.
+- Slider tersedia untuk menampilkan 1 channel secara individu.
+- Menunjukkan representasi spasial patch dari gambar.
+
+**Confidence per Kata (Token Probability):**
+- Menghitung confidence untuk tiap kata dari caption menggunakan `softmax` pada skor token.
+- Sub-token digabungkan menjadi kata dan ditampilkan sebagai bar chart.
+- Memberi gambaran seberapa yakin model terhadap setiap prediksi kata.
+        """
+    }
 ]
+
 
 # --- Session state init ---
 if "current_step" not in st.session_state:

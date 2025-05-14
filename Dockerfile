@@ -27,4 +27,4 @@ EXPOSE 6600
 # RUN pip install gunicorn
 # CMD python ./app.py
 # CMD ["gunicorn", "--bind", "0.0.0.0:6600", "app:app"]
-CMD ["streamlit", "run", "app_streamlit.py", "--server.port=6600", "--server.address=0.0.0.0", "--server.enableXsrfProtection=false", "--server.enableCORS=false"]
+CMD ["streamlit", "run", "app.py", "--server.port=6600", "--server.address=0.0.0.0", "--server.enableXsrfProtection=false", "--server.enableCORS=false"]

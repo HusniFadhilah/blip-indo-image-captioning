@@ -354,7 +354,7 @@ if st.session_state.current_step == 1:
     st.subheader("🔍 Pilih Teknik Visualisasi Fokus Gambar")
     selected_cam = st.selectbox(
         "Metode Explainability", 
-        ["KPCA-CAM", "EigenCAM", "Attention Rollout", "Saliency Map"]
+        ["Attention Rollout", "KPCA-CAM", "EigenCAM", "Saliency Map"]
     )
 
     image = st.session_state.image or load_uploaded_image("imgs/test5.jpg")

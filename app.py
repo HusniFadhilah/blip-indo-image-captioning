@@ -3,6 +3,7 @@ import streamlit as st
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import cv2, torch, torchvision, graphviz
 import io, math, time
 import torch.nn as nn
@@ -119,7 +120,7 @@ def reconstruct_words_and_indices(token_strs, ignore_tokens={'[PAD]', '[SEP]', '
         indices.append(current_idxs)
     return words, indices
 
-def compare_attention_vs_gradcam(model, processor, pixel_values, input_ids, rgb_image):
+def compare_attention_vs_gradcam(model, processor, pixel_values, input_ids, rgb_image, mode="overlay"):
     with torch.no_grad():
         vision_outputs = model.vision_model(pixel_values=pixel_values)
         image_embeds = vision_outputs.last_hidden_state
@@ -143,37 +144,58 @@ def compare_attention_vs_gradcam(model, processor, pixel_values, input_ids, rgb_
         cam_map = LayerAttribution.interpolate(attr, pixel_values.shape[-2:])
         cam_map = cam_map[0].mean(0).detach().cpu().numpy()
         cam_map = (cam_map - cam_map.min()) / (cam_map.max() - cam_map.min() + 1e-8)
-        cam_map_resized = cv2.resize(cam_map, (rgb_image.shape[1], rgb_image.shape[0]))
-        cam_overlay = show_cam_on_image(rgb_image.copy(), cam_map_resized, use_rgb=True)
 
-        gradcam_images.append((word, cam_overlay))
+        cam_map_resized = cv2.resize(cam_map, (rgb_image.shape[1], rgb_image.shape[0]))
+        heatmap = np.uint8(255 * cam_map_resized)
+        heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+
+        if mode == "overlay":
+            overlay = np.clip(rgb_image * 255 + 0.5 * heatmap, 0, 255).astype(np.uint8)
+        elif mode == "heatmap":
+            overlay = heatmap
+        elif mode == "original":
+            overlay = (rgb_image * 255).astype(np.uint8)
+        else:
+            overlay = heatmap
+
+        gradcam_images.append((word, overlay))
 
     if not gradcam_images:
         return None
 
     max_cols = 5
     rows = int(np.ceil(len(gradcam_images) / max_cols))
-    fig, axes = plt.subplots(rows, max_cols, figsize=(3 * max_cols, 3 * rows))
+    fig, axes = plt.subplots(rows, max_cols, figsize=(3.5 * max_cols, 3.5 * rows))
 
-    # Pastikan axes selalu 2D array
     if rows == 1:
         axes = np.expand_dims(axes, 0)
     if max_cols == 1:
         axes = np.expand_dims(axes, 1)
 
-    for idx, (word, gradcam_img) in enumerate(gradcam_images):
+    for idx, (word, img) in enumerate(gradcam_images):
         r, c = divmod(idx, max_cols)
-        axes[r, c].imshow(gradcam_img)
-        axes[r, c].set_title(f"{word}", fontsize=12)
+        axes[r, c].imshow(img)
+        axes[r, c].set_title(f"{word}", fontsize=13)
         axes[r, c].axis("off")
 
-    # Kosongkan sisa kolom di akhir baris terakhir
     for empty_idx in range(len(gradcam_images), rows * max_cols):
         r, c = divmod(empty_idx, max_cols)
         axes[r, c].axis("off")
 
     plt.tight_layout()
     return fig
+
+def apply_cam_overlay(image_np, cam_map, alpha=0.4, colormap=cv2.COLORMAP_JET):
+    cam_heatmap = cv2.applyColorMap(np.uint8(255 * cam_map), colormap)
+    cam_heatmap = cv2.cvtColor(cam_heatmap, cv2.COLOR_BGR2RGB)
+
+    # Resize CAM to match image size
+    cam_heatmap = cv2.resize(cam_heatmap, (image_np.shape[1], image_np.shape[0]), interpolation=cv2.INTER_CUBIC)
+
+    # Combine image and heatmap
+    overlay = (alpha * cam_heatmap + (1 - alpha) * np.uint8(255 * image_np)).astype(np.uint8)
+    return overlay
 
 def draw_blip_architecture():
     graph = graphviz.Digraph(format='png')
@@ -475,6 +497,7 @@ if st.session_state.current_step == 1:
 
     elapsed = round(time.time() - start_time, 2)
     cam_map_resized = cv2.resize(cam_map, (rgb_image.shape[1], rgb_image.shape[0]))
+    # cam_overlay = apply_cam_overlay(rgb_image, cam_map_resized, alpha=0.9)
     cam_overlay = show_cam_on_image(rgb_image.copy(), cam_map_resized, use_rgb=True)
 
     # === Tampilkan Hasil CAM Global
@@ -574,8 +597,11 @@ if st.session_state.current_step == 1:
         pixel_values = inputs["pixel_values"]
         input_ids = st.session_state.generated_ids
 
+        visual_mode = st.radio("Tampilan Grad-CAM", ["overlay", "heatmap", "original"], horizontal=True)
+
+        # Di bagian Grad-CAM per kata:
         fig = compare_attention_vs_gradcam(
-            model, processor, pixel_values, input_ids, rgb_image
+            model, processor, pixel_values, input_ids, rgb_image, mode=visual_mode
         )
 
     if fig:
@@ -634,45 +660,89 @@ if st.session_state.current_step == 2 and st.session_state.image:
                 st.pyplot(fig_grid)
 
     st.markdown("### 📈 Probabilitas Token (Confidence per Kata)")
-    col_left, col_right = st.columns([1, 2])  # kiri gambar, kanan plot
+    # Ambil data caption & skor
+    output_ids = st.session_state.generated_ids[0]
+    gen_output = st.session_state.gen_output
+    scores = gen_output.scores
+    tokens = processor.tokenizer.convert_ids_to_tokens(output_ids)
+    probs = [F.softmax(score[0], dim=-1) for score in scores]
+    selected_probs = [p[output_ids[i+1]].item() for i, p in enumerate(probs)]  # skip BOS
 
+    # Gabungkan sub-token → kata
+    words, indices = reconstruct_words_and_indices(tokens[1:])  # skip BOS
+    word_probs = []
+    word_entropies = []
+    word_margins = []
+
+    for idx_list in indices:
+        if all(i < len(selected_probs) for i in idx_list):
+            # Confidence
+            avg_prob = sum([selected_probs[i] for i in idx_list]) / len(idx_list)
+            word_probs.append(avg_prob)
+
+            # Entropy & margin
+            entropy_list = []
+            margin_list = []
+            for i in idx_list:
+                soft = probs[i]
+                entropy = -torch.sum(soft * torch.log(soft + 1e-8)).item()
+                topk = torch.topk(soft, 2).values
+                margin = abs(topk[0] - topk[1]).item()
+                entropy_list.append(entropy)
+                margin_list.append(margin)
+            word_entropies.append(sum(entropy_list) / len(entropy_list))
+            word_margins.append(sum(margin_list) / len(margin_list))
+
+    # DataFrame gabungan
+    df_token_stats = pd.DataFrame({
+        "Word": words,
+        "Confidence": word_probs,
+        "Entropy": word_entropies,
+        "Top-2 Margin": word_margins
+    })
+
+    # === Fitur 1: Tampilkan peringatan jika ada kata yang low confidence
+    low_conf = df_token_stats[df_token_stats["Confidence"] < 0.5]["Word"].tolist()
+    if low_conf:
+        st.warning("⚠️ Kata dengan confidence rendah: " + ", ".join(low_conf))
+    else:
+        st.success("✅ Semua kata memiliki confidence tinggi.")
+
+    # === Fitur 2: Caption berwarna berdasarkan confidence
+    def color_word(w, p):
+        green = int(p * 255)
+        red = 255 - green
+        return f"<span style='color: rgb({red}, {green}, 0)'>{w}</span>"
+
+    colored_caption = " ".join([color_word(w, p) for w, p in zip(words, word_probs)])
+    st.markdown("### 🖼️ Caption Berwarna Berdasarkan Confidence")
+    st.markdown(f"<p style='font-size:18px'>{colored_caption}</p>", unsafe_allow_html=True)
+
+    # === Fitur 3: Threshold slider untuk filter
+    thresh = st.slider("Tampilkan hanya kata dengan confidence di bawah:", 0.0, 1.0, 0.5)
+    st.dataframe(df_token_stats[df_token_stats["Confidence"] < thresh])
+
+    # === Fitur 4 & 5: Kolom Preview + Grafik
+    col_left, col_right = st.columns([1, 2])
     with col_left:
+        st.markdown("### 📷 Gambar dan Caption")
         st.image(st.session_state.image, caption="Gambar yang Diupload", use_container_width=True)
-
-        output_ids = st.session_state.generated_ids[0]
-        caption = processor.decode(output_ids, skip_special_tokens=True)
-        st.success(f"📄 Caption: \"{caption}\"")
+        st.success("Caption: " + " ".join(words))
 
     with col_right:
-        gen_output = st.session_state.gen_output
-        scores = gen_output.scores
-
-        tokens = processor.tokenizer.convert_ids_to_tokens(output_ids)
-        probs = [F.softmax(score[0], dim=-1) for score in scores]
-        selected_probs = [p[output_ids[i+1]].item() for i, p in enumerate(probs)]  # skip BOS token
-
-        # Gabungkan sub-token
-        words, indices = reconstruct_words_and_indices(tokens[1:])  # skip BOS
-
-        word_probs = []
-        for idx_list in indices:
-            if all(i < len(selected_probs) for i in idx_list):
-                avg_prob = sum([selected_probs[i] for i in idx_list]) / len(idx_list)
-                word_probs.append(avg_prob)
-
-        fig_score, ax_score = plt.subplots(figsize=(8, 3))
-        bars = ax_score.bar(words, word_probs)
-        ax_score.set_ylabel("Probabilitas")
-        ax_score.set_ylim(0, 1.05)
-        ax_score.set_title("Confidence per Kata Output")
+        st.markdown("### 📈 Confidence per Kata")
+        fig, ax = plt.subplots(figsize=(8, 3))
+        bars = ax.bar(words, word_probs, color=["green" if p >= thresh else "red" for p in word_probs])
+        ax.set_ylabel("Confidence")
+        ax.set_ylim(0, 1.05)
+        ax.set_title("Confidence per Kata Output")
 
         for bar, prob in zip(bars, word_probs):
             height = bar.get_height()
-            ax_score.annotate(f"{prob:.2f}", xy=(bar.get_x() + bar.get_width() / 2, height),
-                            xytext=(0, 3), textcoords="offset points",
-                            ha='center', va='bottom', fontsize=8)
-
-        st.pyplot(fig_score)
+            ax.annotate(f"{prob:.2f}", xy=(bar.get_x() + bar.get_width() / 2, height),
+                        xytext=(0, 3), textcoords="offset points",
+                        ha='center', va='bottom', fontsize=8)
+        st.pyplot(fig)
 
 # --- Step 4: Cross-Attention ---
 # if st.session_state.current_step == 3:

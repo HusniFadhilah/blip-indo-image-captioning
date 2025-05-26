@@ -326,6 +326,8 @@ if "current_step" not in st.session_state:
     st.session_state.current_step = 0
 if "image" not in st.session_state:
     st.session_state.image = load_uploaded_image("imgs/test.jpg")
+if "image_uploaded" not in st.session_state:
+    st.session_state.image_uploaded = False
 
 for i in range(len(steps)):
     step_key = f"step_{i}_done"
@@ -355,44 +357,56 @@ if st.session_state.current_step == 0:
             st.image("imgs/test5.jpg", caption="Contoh Gambar Input", use_container_width=True)
         else:
             st.image(st.session_state.image, caption="🖼️ Gambar yang Diunggah", use_container_width=True)
+            st.session_state.image_uploaded = False
+            # Tombol ada di sini, hanya jika ada gambar
+            if st.button("📄 Hasilkan Caption", key="generate_caption_btn", type="primary"):
+                st.session_state.generate_caption = True
+                st.rerun()  # trigger rerender di mana state sudah siap
         st.caption("Format yang didukung: JPG, PNG, WEBP")
+
     with col_right:
         uploaded_file = st.file_uploader("Unggah gambar Anda", type=["jpg", "jpeg", "png", "webp"])
         if uploaded_file:
             st.session_state.image = load_uploaded_image(uploaded_file)
-            st.rerun()
-
-    # Generate Caption
-    image = st.session_state.image
-    inputs = processor(images=image, return_tensors="pt", truncation=True).to(device)
-
-    progress_bar = st.progress(0)
-    progress_text = st.empty()
-    start_total = time.time()
-    progress_text.text("📄 Menghasilkan caption… (0%)")
-
-    with torch.no_grad():
-        gen_output = model.generate(**inputs, return_dict_in_generate=True, output_scores=True)
-        st.session_state.gen_output = gen_output
-        output_ids = gen_output.sequences
-        caption = processor.decode(output_ids[0], skip_special_tokens=True)
-
-    st.session_state.generated_ids = output_ids
-    st.session_state.inputs = inputs
-
-    total_time = round(time.time() - start_total, 2)
-    progress_bar.progress(100)
-    progress_text.text(f"✅ Caption dihasilkan dalam {total_time} detik")
-
-    st.success(f"📄 Caption yang Dihasilkan: \"{caption}\"")
-
+            st.session_state.image_uploaded = True  # 👉 tambahkan flag ini
+            st.session_state.generate_caption = False
+            st.success("✅ Gambar berhasil diunggah. Tekan tombol di bawah untuk menghasilkan caption.")
+            st.rerun()  # rerun hanya untuk update tampilan gambar, belum proses caption
+            
     with st.expander("📊 Tampilkan Arsitektur BLIP"):
         st.graphviz_chart(draw_blip_architecture())
 
     with st.expander("📄 Arsitektur Model BLIP"):
         html_summary = summarize_model_colored(model, max_depth=3)
         st.markdown(html_summary, unsafe_allow_html=True)
-    st.session_state.step_1_done = True
+
+    # Proses hanya jika tombol ditekan
+    if st.session_state.get("generate_caption", False):
+        image = st.session_state.image
+        inputs = processor(images=image, return_tensors="pt", truncation=True).to(device)
+
+        progress_bar = st.progress(0)
+        progress_text = st.empty()
+        start_total = time.time()
+        progress_text.text("📄 Menghasilkan caption… (0%)")
+
+        with torch.no_grad():
+            gen_output = model.generate(**inputs, return_dict_in_generate=True, output_scores=True)
+            st.session_state.gen_output = gen_output
+            output_ids = gen_output.sequences
+            caption = processor.decode(output_ids[0], skip_special_tokens=True)
+
+        st.session_state.generated_ids = output_ids
+        st.session_state.inputs = inputs
+
+        total_time = round(time.time() - start_total, 2)
+        progress_bar.progress(100)
+        progress_text.text(f"✅ Caption dihasilkan dalam {total_time} detik")
+
+        st.success(f"📄 Caption yang Dihasilkan: \"{caption}\"")
+
+        st.session_state.generate_caption = False  # Reset agar tidak auto trigger ulang
+    st.session_state.step_1_done = True  # Step 1 selesai
 
 # --- Step 2: Visualisasi CAM ---
 if st.session_state.current_step == 1:
@@ -620,37 +634,45 @@ if st.session_state.current_step == 2 and st.session_state.image:
                 st.pyplot(fig_grid)
 
     st.markdown("### 📈 Probabilitas Token (Confidence per Kata)")
+    col_left, col_right = st.columns([1, 2])  # kiri gambar, kanan plot
 
-    gen_output = st.session_state.gen_output
-    output_ids = st.session_state.generated_ids[0]
-    scores = gen_output.scores
+    with col_left:
+        st.image(st.session_state.image, caption="Gambar yang Diupload", use_container_width=True)
 
-    tokens = processor.tokenizer.convert_ids_to_tokens(output_ids)
-    probs = [F.softmax(score[0], dim=-1) for score in scores]
-    selected_probs = [p[output_ids[i+1]].item() for i, p in enumerate(probs)]  # skip BOS token
+        output_ids = st.session_state.generated_ids[0]
+        caption = processor.decode(output_ids, skip_special_tokens=True)
+        st.success(f"📄 Caption: \"{caption}\"")
 
-    # Gabungkan sub-token
-    words, indices = reconstruct_words_and_indices(tokens[1:])  # skip BOS
+    with col_right:
+        gen_output = st.session_state.gen_output
+        scores = gen_output.scores
 
-    word_probs = []
-    for idx_list in indices:
-        if all(i < len(selected_probs) for i in idx_list):
-            avg_prob = sum([selected_probs[i] for i in idx_list]) / len(idx_list)
-            word_probs.append(avg_prob)
+        tokens = processor.tokenizer.convert_ids_to_tokens(output_ids)
+        probs = [F.softmax(score[0], dim=-1) for score in scores]
+        selected_probs = [p[output_ids[i+1]].item() for i, p in enumerate(probs)]  # skip BOS token
 
-    fig_score, ax_score = plt.subplots(figsize=(8, 3))
-    bars = ax_score.bar(words, word_probs)
-    ax_score.set_ylabel("Probabilitas")
-    ax_score.set_ylim(0, 1.05)
-    ax_score.set_title("Confidence per Kata Output")
+        # Gabungkan sub-token
+        words, indices = reconstruct_words_and_indices(tokens[1:])  # skip BOS
 
-    for bar, prob in zip(bars, word_probs):
-        height = bar.get_height()
-        ax_score.annotate(f"{prob:.2f}", xy=(bar.get_x() + bar.get_width() / 2, height),
-                        xytext=(0, 3), textcoords="offset points",
-                        ha='center', va='bottom', fontsize=8)
+        word_probs = []
+        for idx_list in indices:
+            if all(i < len(selected_probs) for i in idx_list):
+                avg_prob = sum([selected_probs[i] for i in idx_list]) / len(idx_list)
+                word_probs.append(avg_prob)
 
-    st.pyplot(fig_score)
+        fig_score, ax_score = plt.subplots(figsize=(8, 3))
+        bars = ax_score.bar(words, word_probs)
+        ax_score.set_ylabel("Probabilitas")
+        ax_score.set_ylim(0, 1.05)
+        ax_score.set_title("Confidence per Kata Output")
+
+        for bar, prob in zip(bars, word_probs):
+            height = bar.get_height()
+            ax_score.annotate(f"{prob:.2f}", xy=(bar.get_x() + bar.get_width() / 2, height),
+                            xytext=(0, 3), textcoords="offset points",
+                            ha='center', va='bottom', fontsize=8)
+
+        st.pyplot(fig_score)
 
 # --- Step 4: Cross-Attention ---
 # if st.session_state.current_step == 3:

@@ -176,7 +176,7 @@ def compare_attention_vs_gradcam(model, processor, pixel_values, input_ids, rgb_
     for idx, (word, img) in enumerate(gradcam_images):
         r, c = divmod(idx, max_cols)
         axes[r, c].imshow(img)
-        axes[r, c].set_title(f"{word}", fontsize=13)
+        axes[r, c].set_title(f"{word}", fontsize=17)
         axes[r, c].axis("off")
 
     for empty_idx in range(len(gradcam_images), rows * max_cols):
@@ -432,10 +432,13 @@ if st.session_state.current_step == 0:
 
 # --- Step 2: Visualisasi CAM ---
 if st.session_state.current_step == 1:
+    if "inputs" not in st.session_state or "generated_ids" not in st.session_state:
+        st.warning("⚠️ Silakan unggah gambar dan tekan tombol '📄 Hasilkan Caption' terlebih dahulu.")
+        st.stop()
     st.subheader("🔍 Pilih Teknik Visualisasi Fokus Gambar")
     selected_cam = st.selectbox(
         "Metode Explainability", 
-        ["Attention Rollout", "KPCA-CAM", "EigenCAM", "Saliency Map"]
+        ["KPCA-CAM", "Attention Rollout", "EigenCAM", "Saliency Map"]
     )
 
     image = st.session_state.image or load_uploaded_image("imgs/test5.jpg")
@@ -577,7 +580,7 @@ if st.session_state.current_step == 1:
         for idx, (word, overlay_img) in enumerate(cross_images):
             r, c = divmod(idx, max_cols)
             axes[r, c].imshow(overlay_img)
-            axes[r, c].set_title(f"{word}", fontsize=10)
+            axes[r, c].set_title(f"{word}", fontsize=17)
             axes[r, c].axis("off")
 
         # Kosongkan sisa slot

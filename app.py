@@ -368,7 +368,7 @@ for i, col in enumerate(cols):
 current_step = steps[st.session_state.current_step]
 st.markdown(f'<div class="step-header">Langkah {st.session_state.current_step + 1}: {current_step["title"]}</div>', unsafe_allow_html=True)
 st.markdown(f'<div class="step-description">{current_step["description"]}</div>', unsafe_allow_html=True)
-with st.expander("Tampilkan Detail Teknis"):
+with st.expander("Tampilkan Detail Teknis", expanded=True):
     st.markdown(f'<div class="tech-details">{current_step["tech_details"]}</div>', unsafe_allow_html=True)
 
 # --- Step 1: Image Upload ---
@@ -616,6 +616,9 @@ if st.session_state.current_step == 1:
 # --- Step 3: Feature Map ---
 if st.session_state.current_step == 2 and st.session_state.image:
 # if st.session_state.current_step == 2:
+    if "inputs" not in st.session_state or "generated_ids" not in st.session_state:
+        st.warning("⚠️ Silakan unggah gambar dan tekan tombol '📄 Hasilkan Caption' terlebih dahulu.")
+        st.stop()
     st.subheader("🔍 Analisis Feature Map")
 
     # Ambil tensor gambar

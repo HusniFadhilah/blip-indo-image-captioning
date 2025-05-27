@@ -8,8 +8,29 @@ import numpy as np
 from PIL import Image
 from transformers import BlipProcessor, BlipForConditionalGeneration
 
-# Ganti ini jika file aslinya bukan bernama xcapindo_app.py
-from app import factorize, reconstruct_words_and_indices
+
+def reconstruct_words_and_indices(token_strs, ignore_tokens={'[PAD]', '[SEP]', '.', ',', ';', '!', '?', '[CLS]', '[MASK]', '[UNK]'}):
+    words = []
+    indices = []
+    current_word = ""
+    current_idxs = []
+
+    for idx, token in enumerate(token_strs):
+        if token is None or token in ignore_tokens:
+            continue
+        if token.startswith("##"):
+            current_word += token[2:]
+            current_idxs.append(idx)
+        else:
+            if current_word:
+                words.append(current_word)
+                indices.append(current_idxs)
+            current_word = token
+            current_idxs = [idx]
+    if current_word:
+        words.append(current_word)
+        indices.append(current_idxs)
+    return words, indices
 
 # -------- Fixtures --------
 

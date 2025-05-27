@@ -758,7 +758,7 @@ if st.session_state.current_step == 2 and st.session_state.image:
             height = bar.get_height()
             ax.annotate(f"{prob:.2f}", xy=(bar.get_x() + bar.get_width() / 2, height),
                         xytext=(0, 3), textcoords="offset points",
-                        ha='center', va='bottom', fontsize=8)
+                        ha='center', va='bottom', fontsize=8, rotation=45)
         st.pyplot(fig)
 
 # --- Step 4: Cross-Attention ---

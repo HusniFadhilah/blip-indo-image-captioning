@@ -21,9 +21,9 @@ st.set_page_config(page_title="X-Capindo - Visualisasi Proses Image Captioning",
 st.markdown("""
 <style>
     .main-header { font-size: 2.5rem; font-weight: bold; color: #1E3A8A; text-align: center; margin-bottom: 1rem; }
-    .sub-header { font-size: 1.2rem; color: #4B5563; text-align: center; margin-bottom: 2rem; }
+    .sub-header { font-size: 1.2rem; color: #dddddd; text-align: center; margin-bottom: 2rem; }
     .step-header { font-size: 1.8rem; font-weight: bold; color: #1E3A8A; margin-bottom: 1rem; }
-    .step-description { font-size: 1.1rem; color: #4B5563; margin-bottom: 1.5rem; }
+    .step-description { font-size: 1.1rem; color: #dddddd; margin-bottom: 1.5rem; }
     .tech-details { background-color: #EFF6FF; color: black; border-radius: 0.5rem; padding: 1rem; margin-bottom: 1.5rem; }
     .stButton button { width: 100%; }
 </style>
@@ -33,13 +33,19 @@ st.markdown("""
 st.markdown('<div class="main-header">Visualisasi Proses Image Captioning</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Pelajari tahapan bagaimana AI menghasilkan deskripsi dari gambar</div>', unsafe_allow_html=True)
 
+# --- Session init ---
+if "model_loaded_once" not in st.session_state:
+    st.session_state.model_loaded_once = False
+
 # --- Sidebar Info ---
 with st.sidebar.expander("ℹ️ Tentang X-Capindo", expanded=True):
+    def set_model_flag():
+        st.session_state.model_loaded_once = True
     st.image("imgs/logo.png", width=90)
     model_option = st.selectbox(
         "🔧 Pilih Model BLIP",
         ["BLIP-Large (local)", "BLIP-Base (local)", "BLIP-Base (HF Hub)", "BLIP-Large (HF Hub)"],
-        key="model_selection"
+        key="model_selection",on_change=set_model_flag
     )
     st.markdown("""
 **X-Capindo** adalah aplikasi captioning berbasis BLIP (Salesforce) yang dilengkapi dengan penjelasan visual melalui CAM (Class Activation Maps), attention transformer, dan feature map.
@@ -81,6 +87,11 @@ def load_model(model_choice="BLIP-Large (local)"):
     return processor, model
 
 processor, model = load_model(st.session_state.get("model_selection", "BLIP-Large (local)"))
+
+# ✅ Global-style alert jika model dimuat ulang
+if st.session_state.model_loaded_once:
+    st.markdown(f'<div class="global-alert">✅ Model berhasil dimuat: {st.session_state.get("model_selection")}</div>', unsafe_allow_html=True)
+    st.session_state.model_loaded_once = False
 
 # --- Image Upload Helper ---
 @st.cache_data

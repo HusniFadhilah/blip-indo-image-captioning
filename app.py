@@ -1038,7 +1038,7 @@ if st.session_state.current_step == 1:
                     return round(road_score, 4)
                     
             except Exception as e:
-                st.warning(f"ROAD evaluation error: {str(e)}")
+                st.warning(f"ROAD metric evaluation error: {str(e)}")
                 return 0.0
 
         # Progress indicator

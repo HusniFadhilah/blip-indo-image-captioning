@@ -844,7 +844,7 @@ if st.session_state.current_step == 1:
         with method_col:
             selected_cam = st.selectbox(
                 "Metode Explainability", 
-                ["KPCA-CAM", "EigenCAM", "Attention Rollout", "Saliency Map", "Ensemble Methods"]
+                ["EigenCAM", "KPCA-CAM", "Attention Rollout", "Saliency Map", "Ensemble Methods"]
             )
         with opt_col:
             optimization_level = st.selectbox(

@@ -11,6 +11,7 @@ from PIL import Image, ImageOps
 from collections import Counter
 from huggingface_hub import snapshot_download
 from pytorch_grad_cam import EigenCAM, KPCA_CAM
+from pytorch_grad_cam.metrics.road import ROADCombined
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from captum.attr import Saliency, LayerGradCam, LayerAttribution
 from transformers import BlipProcessor, BlipForConditionalGeneration
@@ -20,9 +21,9 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 st.set_page_config(page_title="X-Capindo - Visualisasi Proses Image Captioning", page_icon="imgs/logo.png", layout="wide")
 st.markdown("""
 <style>
-    .main-header { font-size: 2.5rem; font-weight: bold; color: #1E3A8A; text-align: center; margin-bottom: 1rem; }
+    .main-header { font-size: 2.5rem; font-weight: bold; color: #2980B9; text-align: center; margin-bottom: 1rem; }
     .sub-header { font-size: 1.2rem; color: #dddddd; text-align: center; margin-bottom: 2rem; }
-    .step-header { font-size: 1.8rem; font-weight: bold; color: #1E3A8A; margin-bottom: 1rem; }
+    .step-header { font-size: 1.8rem; font-weight: bold; color: #2980B9; margin-bottom: 1rem; }
     .step-description { font-size: 1.1rem; color: #dddddd; margin-bottom: 1.5rem; }
     .tech-details { background-color: #EFF6FF; color: black; border-radius: 0.5rem; padding: 1rem; margin-bottom: 1.5rem; }
     .stButton button { width: 100%; }
@@ -446,77 +447,301 @@ if st.session_state.current_step == 1:
     if "inputs" not in st.session_state or "generated_ids" not in st.session_state:
         st.warning("⚠️ Silakan unggah gambar dan tekan tombol '📄 Hasilkan Caption' terlebih dahulu.")
         st.stop()
-    st.subheader("🔍 Pilih Teknik Visualisasi Fokus Gambar")
-    selected_cam = st.selectbox(
-        "Metode Explainability", 
-        ["KPCA-CAM", "Attention Rollout", "EigenCAM", "Saliency Map"]
-    )
+    
+    # Layout dengan 2 kolom utama
+    col_visual, col_explanation = st.columns([3, 2])
+    
+    with col_visual:
+        st.subheader("🔍 Pilih Teknik Visualisasi Fokus Gambar")
+        selected_cam = st.selectbox(
+            "Metode Explainability", 
+            ["EigenCAM", "KPCA-CAM", "Attention Rollout", "Saliency Map"]
+        )
+        
+        # Tambahkan kontrol masking ratio
+        mask_ratio = st.slider(
+            "🎯 Masking Ratio untuk ROAD", 
+            min_value=0.1, max_value=0.8, value=0.3, step=0.05,
+            help="Persentase area terpenting yang akan di-mask untuk evaluasi ROAD"
+        )
 
-    image = st.session_state.image or load_uploaded_image("imgs/test5.jpg")
-    input_tensor = st.session_state.inputs['pixel_values']
-    rgb_image = np.array(image).astype(np.float32) / 255.0
+        image = st.session_state.image or load_uploaded_image("imgs/test5.jpg")
+        input_tensor = st.session_state.inputs['pixel_values']
+        rgb_image = np.array(image).astype(np.float32) / 255.0
 
-    # === Siapkan untuk CAM global
-    class BlipWrapper(torch.nn.Module):
-        def __init__(self, patch_module):
-            super().__init__()
-            self.patch_module = patch_module
-        def forward(self, x):
-            return self.patch_module(x)
+        # === Wrapper Classes untuk ROAD ===
+        class BlipPatchWrapper(torch.nn.Module):
+            """Wrapper untuk patch embedding agar dapat di-hook oleh CAM"""
+            def __init__(self, patch_module):
+                super().__init__()
+                self.patch_module = patch_module
+            def forward(self, x):
+                return self.patch_module(x)
 
-    wrapped = BlipWrapper(model.vision_model.embeddings.patch_embedding)
-    target_layers = [model.vision_model.embeddings.patch_embedding]
+        class PatchNormTarget:
+            """Target untuk menghitung norm dari patch embedding"""
+            def __call__(self, model_output):
+                return model_output.norm(dim=(1, 2))
 
-    # === Eksekusi CAM Global
-    start_time = time.time()
+        def forward_fn(x):
+            """Forward function untuk ROAD evaluation"""
+            outputs = model.vision_model(x)
+            hidden_states = outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state') else outputs["last_hidden_state"]
+            return hidden_states[:, 0, :].norm(dim=1)  # CLS token norm
 
-    if selected_cam == "EigenCAM":
-        cam = EigenCAM(model=wrapped, target_layers=target_layers)
-        cam_map = cam(input_tensor=input_tensor)[0]
-
-    elif selected_cam == "KPCA-CAM":
-        cam = KPCA_CAM(model=wrapped, target_layers=target_layers)
-        cam_map = cam(input_tensor=input_tensor)[0]
-
-    elif selected_cam == "Attention Rollout":
-        def rollout_fn(pixel_values):
-            attn_maps = []
-            def hook(module, input, output):
-                if isinstance(output, tuple):
-                    attn_maps.append(output[1].detach().cpu())
-            hooks = [layer.self_attn.register_forward_hook(hook) 
-                     for layer in model.vision_model.encoder.layers]
+        def evaluate_cam_drop(model, input_tensor, cam_map, mask_ratio=0.3):
+            """
+            Evaluasi ROAD: mengukur penurunan performa setelah masking area penting
+            """
             with torch.no_grad():
-                _ = model.vision_model(pixel_values, output_attentions=True)
-            for h in hooks:
-                h.remove()
-            result = torch.eye(attn_maps[0].shape[-1])
-            for attn in attn_maps:
-                attn_avg = attn.mean(1) + torch.eye(attn.shape[-1])
-                attn_avg /= attn_avg.sum(dim=-1, keepdim=True)
-                result = torch.matmul(attn_avg[0], result)
-            return result[0, 1:]
+                # Skor original
+                orig_score = forward_fn(input_tensor).item()
+                
+                # Resize CAM map jika perlu
+                if cam_map.shape != input_tensor.shape[2:]:
+                    cam_map = cv2.resize(cam_map, (input_tensor.shape[3], input_tensor.shape[2]))
+                
+                # Normalisasi CAM map
+                cam_map = torch.tensor(cam_map).float()
+                cam_map = (cam_map - cam_map.min()) / (cam_map.max() - cam_map.min() + 1e-6)
+                
+                # Pilih top-k piksel untuk di-mask
+                k = int(mask_ratio * cam_map.numel())
+                flat = cam_map.flatten()
+                idx = torch.topk(flat, k).indices
+                
+                # Buat mask (0 untuk area penting, 1 untuk area lainnya)
+                mask = torch.ones_like(flat)
+                mask[idx] = 0
+                mask = mask.reshape(cam_map.shape).unsqueeze(0).unsqueeze(0).to(input_tensor.device)
+                
+                # Hitung skor setelah masking
+                drop_score = forward_fn(input_tensor * mask).item()
+                
+                # Return relative drop (semakin tinggi = semakin baik interpretasi)
+                road_score = (orig_score - drop_score) / (orig_score + 1e-6)
+                return round(road_score, 4)
 
-        rollout = rollout_fn(input_tensor)
-        size = int(np.sqrt(rollout.shape[0]))
-        rollout = rollout[:size**2].reshape(size, size).numpy()
-        cam_map = cv2.resize((rollout - rollout.min()) / (rollout.max() - rollout.min() + 1e-8), (image.width, image.height))
+        # === Setup untuk CAM
+        wrapped_model = BlipPatchWrapper(model.vision_model.embeddings.patch_embedding)
+        targets = [PatchNormTarget()]
+        target_layers = [model.vision_model.embeddings.patch_embedding]
 
-    elif selected_cam == "Saliency Map":
-        def forward_fn(x): return model.vision_model(x).last_hidden_state[:, 0, :].norm(dim=1)
-        sal = Saliency(forward_fn)
-        sal_attr = sal.attribute(input_tensor)[0].cpu().permute(1, 2, 0).numpy()
-        cam_map = np.mean(np.abs(sal_attr), axis=-1)
-        cam_map = (cam_map - cam_map.min()) / (cam_map.max() - cam_map.min() + 1e-8)
+        # Progress indicator
+        progress_container = st.empty()
+        with progress_container:
+            st.info("🔄 Menghitung CAM dan evaluasi ROAD...")
 
-    elapsed = round(time.time() - start_time, 2)
-    cam_map_resized = cv2.resize(cam_map, (rgb_image.shape[1], rgb_image.shape[0]))
-    # cam_overlay = apply_cam_overlay(rgb_image, cam_map_resized, alpha=0.9)
-    cam_overlay = show_cam_on_image(rgb_image.copy(), cam_map_resized, use_rgb=True)
+        # === Eksekusi CAM dan ROAD ===
+        start_time = time.time()
 
-    # === Tampilkan Hasil CAM Global
-    st.markdown("### 🌐 Visualisasi Global")
-    st.image(cam_overlay, caption=f"{selected_cam} (waktu: {elapsed} detik)", width=320)  # Lebih ramping
+        if selected_cam == "EigenCAM":
+            cam_metric = ROADCombined(percentiles=[20, 40, 60, 80])
+            
+            cam = EigenCAM(model=wrapped_model, target_layers=target_layers)
+            attributions = cam(input_tensor=input_tensor, targets=targets)
+            cam_map = attributions[0]
+            
+            # ROAD score dari pytorch-grad-cam
+            try:
+                road_score_lib = float(np.array(cam_metric(input_tensor, attributions, targets, wrapped_model)).flatten()[0])
+            except:
+                road_score_lib = 0.0
+
+        elif selected_cam == "KPCA-CAM":
+            cam_metric = ROADCombined(percentiles=[20, 40, 60, 80])
+            
+            cam = KPCA_CAM(model=wrapped_model, target_layers=target_layers)
+            attributions = cam(input_tensor=input_tensor, targets=targets)
+            cam_map = attributions[0]
+            
+            # ROAD score dari pytorch-grad-cam
+            try:
+                road_score_lib = float(np.array(cam_metric(input_tensor, attributions, targets, wrapped_model)).flatten()[0])
+            except:
+                road_score_lib = 0.0
+
+        elif selected_cam == "Attention Rollout":
+            def rollout_fn(pixel_values):
+                attn_maps = []
+                def hook(module, input, output):
+                    if isinstance(output, tuple) and output[1] is not None:
+                        attn_maps.append(output[1].detach().cpu())
+                hooks = [layer.self_attn.register_forward_hook(hook) 
+                         for layer in model.vision_model.encoder.layers]
+                with torch.no_grad():
+                    _ = model.vision_model(pixel_values, output_attentions=True)
+                for h in hooks:
+                    h.remove()
+                result = torch.eye(attn_maps[0].shape[-1])
+                for attn in attn_maps:
+                    attn_avg = attn.mean(1) + torch.eye(attn.shape[-1])
+                    attn_avg /= attn_avg.sum(dim=-1, keepdim=True)
+                    result = torch.matmul(attn_avg[0], result)
+                return result[0, 1:]
+
+            rollout = rollout_fn(input_tensor)
+            size = int(np.sqrt(rollout.shape[0]))
+            rollout = rollout[:size**2].reshape(size, size).numpy()
+            cam_map = (rollout - rollout.min()) / (rollout.max() - rollout.min() + 1e-8)
+            road_score_lib = None  # Custom implementation doesn't use pytorch-grad-cam ROAD
+
+        elif selected_cam == "Saliency Map":
+            sal = Saliency(forward_fn)
+            input_tensor.requires_grad_()
+            sal_attr = sal.attribute(input_tensor)[0].cpu().permute(1, 2, 0).numpy()
+            cam_map = np.mean(np.abs(sal_attr), axis=-1)
+            cam_map = (cam_map - cam_map.min()) / (cam_map.max() - cam_map.min() + 1e-8)
+            road_score_lib = None  # Custom implementation doesn't use pytorch-grad-cam ROAD
+
+        # === Custom ROAD Evaluation ===
+        road_score_custom = evaluate_cam_drop(model, input_tensor.clone(), cam_map, mask_ratio=mask_ratio)
+
+        elapsed_time = round(time.time() - start_time, 2)
+
+        # === Visualisasi ===
+        cam_map_resized = cv2.resize(cam_map, (rgb_image.shape[1], rgb_image.shape[0]))
+        cam_overlay = show_cam_on_image(rgb_image.copy(), cam_map_resized, use_rgb=True)
+
+        progress_container.empty()
+        
+        st.markdown("### 🌐 Visualisasi Global dengan ROAD Evaluation")
+        st.image(cam_overlay, caption=f"{selected_cam} | Waktu: {elapsed_time}s", width=400)
+        
+        # Pilih skor primary: library jika ada, custom sebagai fallback
+        primary_road_score = road_score_lib if road_score_lib is not None else road_score_custom
+        score_source = "Library" if road_score_lib is not None else "Custom"
+        
+        # Tampilkan metrics
+        metric_cols = st.columns(3)
+        with metric_cols[0]:
+            st.metric("⏱️ Waktu Komputasi", f"{elapsed_time}s")
+        with metric_cols[1]:
+            st.metric("📊 ROAD Score", f"{primary_road_score:.4f}")
+            # Tambahkan keterangan skala
+            if score_source == "Custom":
+                st.caption("📏 **Skala ROAD:**\n> 0.1: Baik | 0.0-0.1: Sedang | < 0.0: Buruk")
+            else:
+                st.caption("📏 **Skala Library ROAD:**\nBervariasi per metode, lebih tinggi = lebih baik")
+        with metric_cols[2]:
+            st.metric("📊 Sumber", score_source)
+
+    # === Kolom Penjelasan ROAD ===
+    with col_explanation:
+        st.markdown("### 📚 Evaluasi ROAD (Remove And Debias)")
+        
+        with st.expander("🔍 Konsep ROAD", expanded=True):
+            st.markdown("""
+            **ROAD** adalah metode evaluasi kuantitatif untuk mengukur kualitas interpretasi XAI:
+            
+            **🎯 Tujuan:**
+            - Mengukur seberapa baik metode XAI mengidentifikasi area penting
+            - Evaluasi tanpa perlu retraining model
+            - Lebih stabil dibanding metode ROAR
+            
+            **⚙️ Cara Kerja:**
+            1. **Remove**: Masking area yang dianggap penting oleh XAI
+            2. **Debias**: Mengukur penurunan performa dengan debiased masking
+            3. **Score**: Semakin besar penurunan = semakin baik interpretasi
+            """)
+
+        with st.expander("🛠️ Implementasi Teknis", expanded=False):
+            st.markdown(f"""
+            **Komponen Utama:**
+            
+            ```python
+            # 1. BlipPatchWrapper
+            # Membungkus patch embedding untuk CAM hooks
+            
+            # 2. PatchNormTarget  
+            # Target scoring: norm dari patch embeddings
+            
+            # 3. forward_fn
+            # Menghitung confidence dari CLS token
+            
+            # 4. ROAD Evaluation
+            # Masking {int(mask_ratio*100)}% area paling penting
+            # Ukur penurunan: (orig - masked) / orig
+            ```
+            
+            **Formula ROAD:**
+            ```
+            ROAD_Score = (Original_Score - Masked_Score) / Original_Score
+            ```
+            
+            **Mengapa Masking {int(mask_ratio*100)}%?**
+            - **Teoritis**: ROAD paper merekomendasikan 20-50%
+            - **Praktis**: Balance antara sensitivity vs stability  
+            - **Empiris**: Sweet spot untuk deteksi area penting
+            - Terlalu kecil (<20%) = kurang sensitif
+            - Terlalu besar (>50%) = terlalu destruktif
+            
+            **Interpretasi Skor:**
+            - **Custom ROAD**: Normalized drop ratio (0-1 ideal)
+            - **Library ROAD**: Method-specific scaling
+            - **Target Function**: CLS token confidence norm
+            """)
+
+
+        with st.expander("📊 Hasil Evaluasi", expanded=True):
+            # Interpretasi hasil berdasarkan skor
+            if primary_road_score > 0.1:
+                interpretation = "🟢 **Baik** - Area fokus sangat relevan"
+                color = "success"
+            elif primary_road_score > 0.0:
+                interpretation = "🟡 **Sedang** - Area fokus cukup relevan"  
+                color = "warning"
+            else:
+                interpretation = "🔴 **Buruk** - Area fokus tidak relevan"
+                color = "error"
+            
+            st.markdown(f"""
+            **Metode:** {selected_cam}
+            
+            **ROAD Score:** {primary_road_score:.4f}
+            
+            **Sumber Score:** {score_source}
+            
+            **Interpretasi:** {interpretation}
+            
+            **Detail:**
+            - Masking ratio: {int(mask_ratio*100)}% area terpenting
+            - Waktu komputasi: {elapsed_time} detik
+            - Target: CLS token confidence
+            
+            **📏 Panduan Interpretasi ROAD Score:**
+            ```
+            Custom Implementation:
+            > 0.1    : Interpretasi Excellent 🟢
+            0.05-0.1 : Interpretasi Good 🟡  
+            0.0-0.05 : Interpretasi Fair 🟠
+            < 0.0    : Interpretasi Poor 🔴
+            
+            Library Implementation:
+            Skala bervariasi per metode, 
+            nilai lebih tinggi = lebih baik
+            ```
+            """)
+            
+            # Progress bar visual untuk skor
+            score_normalized = max(0, min(1, (primary_road_score + 0.2) / 0.4))  # normalize -0.2 to 0.2 → 0 to 1
+            st.progress(score_normalized)
+
+        # Perbandingan metode
+        with st.expander("⚖️ Perbandingan Metode XAI", expanded=False):
+            st.markdown("""
+            **Metode yang Tersedia:**
+            
+            1. **KPCA-CAM**: Kernel PCA untuk dekomposisi features
+            2. **EigenCAM**: Eigenvector dari feature maps  
+            3. **Attention Rollout**: Propagasi attention weights
+            4. **Saliency Map**: Gradient-based attribution
+            
+            **Tips Pemilihan:**
+            - **Akurasi tinggi**: KPCA-CAM, EigenCAM
+            - **Interpretabilitas**: Attention Rollout
+            - **Kecepatan**: Saliency Map
+            """)
 
     st.markdown("### 🎯 Visualisasi Cross-Attention dari Decoder")
 

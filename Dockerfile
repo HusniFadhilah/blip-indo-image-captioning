@@ -19,7 +19,9 @@ RUN mkdir logs
 COPY . /app
 
 COPY requirements.txt .
+ENV PIP_NO_CACHE_DIR=1
 RUN pip install -r ./requirements.txt
+
 
 EXPOSE 6600
 

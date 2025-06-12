@@ -15,6 +15,7 @@ from pytorch_grad_cam.metrics.road import ROADCombined
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from captum.attr import Saliency, LayerGradCam, LayerAttribution
 from transformers import BlipProcessor, BlipForConditionalGeneration
+from cam import *
 
 # --- Setup ---
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -380,7 +381,7 @@ for i, col in enumerate(cols):
 current_step = steps[st.session_state.current_step]
 st.markdown(f'<div class="step-header">Langkah {st.session_state.current_step + 1}: {current_step["title"]}</div>', unsafe_allow_html=True)
 st.markdown(f'<div class="step-description">{current_step["description"]}</div>', unsafe_allow_html=True)
-with st.expander("Tampilkan Detail Teknis", expanded=True):
+with st.expander("Tampilkan Detail Teknis", expanded=False):
     st.markdown(f'<div class="tech-details">{current_step["tech_details"]}</div>', unsafe_allow_html=True)
 
 # --- Step 1: Image Upload ---
@@ -453,17 +454,36 @@ if st.session_state.current_step == 1:
     
     with col_visual:
         st.subheader("🔍 Pilih Teknik Visualisasi Fokus Gambar")
-        selected_cam = st.selectbox(
-            "Metode Explainability", 
-            ["EigenCAM", "KPCA-CAM", "Attention Rollout", "Saliency Map"]
-        )
         
-        # Tambahkan kontrol masking ratio
-        mask_ratio = st.slider(
-            "🎯 Masking Ratio untuk ROAD", 
-            min_value=0.1, max_value=0.8, value=0.3, step=0.05,
-            help="Persentase area terpenting yang akan di-mask untuk evaluasi ROAD"
-        )
+        # Row 1: Method selection and optimization level
+        method_col, opt_col = st.columns([2, 1])
+        with method_col:
+            selected_cam = st.selectbox(
+                "Metode Explainability", 
+                ["KPCA-CAM", "EigenCAM", "Attention Rollout", "Saliency Map", "Ensemble (All Methods)"]
+            )
+        with opt_col:
+            optimization_level = st.selectbox(
+                "🚀 Level Optimasi",
+                ["basic", "high", "research"],
+                index=1,
+                help="basic: Standard | high: Multi-scale + Post-process | research: Ensemble + Advanced"
+            )
+        
+        # Row 2: Advanced controls
+        adv_col1, adv_col2 = st.columns(2)
+        with adv_col1:
+            mask_ratio = st.slider(
+                "🎯 Masking Ratio untuk ROAD", 
+                min_value=0.1, max_value=0.8, value=0.3, step=0.05,
+                help="Persentase area terpenting yang akan di-mask untuk evaluasi ROAD"
+            )
+        with adv_col2:
+            post_process_method = st.selectbox(
+                "🔧 Post-Processing",
+                ["gaussian_smooth", "bilateral_filter", "morphological", "threshold_smooth"],
+                help="Metode untuk meningkatkan kualitas CAM"
+            )
 
         image = st.session_state.image or load_uploaded_image("imgs/test5.jpg")
         input_tensor = st.session_state.inputs['pixel_values']
@@ -530,68 +550,89 @@ if st.session_state.current_step == 1:
         # Progress indicator
         progress_container = st.empty()
         with progress_container:
-            st.info("🔄 Menghitung CAM dan evaluasi ROAD...")
+            st.info(f"🔄 Menghitung CAM dengan optimasi level {optimization_level}...")
 
-        # === Eksekusi CAM dan ROAD ===
+        # === Eksekusi CAM Optimized ===
         start_time = time.time()
 
-        if selected_cam == "EigenCAM":
-            cam_metric = ROADCombined(percentiles=[20, 40, 60, 80])
+        # Gunakan fungsi optimasi yang baru
+        if optimization_level in ["basic", "high", "research"]:
+            # Convert method name untuk compatibility
+            method_map = {
+                "KPCA-CAM": "KPCA-CAM",
+                "EigenCAM": "EigenCAM", 
+                "Attention Rollout": "Attention",
+                "Saliency Map": "Saliency",
+                "Ensemble (All Methods)": "Ensemble"
+            }
             
-            cam = EigenCAM(model=wrapped_model, target_layers=target_layers)
-            attributions = cam(input_tensor=input_tensor, targets=targets)
-            cam_map = attributions[0]
+            method_key = method_map.get(selected_cam, "EigenCAM")
             
-            # ROAD score dari pytorch-grad-cam
+            # Call optimized function
             try:
-                road_score_lib = float(np.array(cam_metric(input_tensor, attributions, targets, wrapped_model)).flatten()[0])
-            except:
-                road_score_lib = 0.0
+                result = optimize_cam_prediction(
+                    model=model,
+                    input_tensor=input_tensor,
+                    rgb_image=rgb_image,
+                    method=method_key,
+                    optimization_level=optimization_level
+                )
+                
+                cam_map = result["cam_map"]
+                road_score_optimized = result["road_score"]
+                elapsed_time = result["elapsed_time"]
+                
+                # Apply additional post-processing if requested
+                cam_map = post_process_cam(cam_map, post_process_method)
+                
+                # Library ROAD score (jika tersedia)
+                road_score_lib = None
+                if selected_cam in ["EigenCAM", "KPCA-CAM"]:
+                    try:
+                        wrapped_model = BlipPatchWrapper(model.vision_model.embeddings.patch_embedding)
+                        targets = [AdaptiveTarget(model, "cls_norm")]
+                        cam_metric = ROADCombined(percentiles=[20, 40, 60, 80])
+                        
+                        # Quick single-scale for library comparison
+                        if selected_cam == "EigenCAM":
+                            cam_lib = EigenCAM(model=wrapped_model, target_layers=[model.vision_model.embeddings.patch_embedding])
+                        else:
+                            cam_lib = KPCA_CAM(model=wrapped_model, target_layers=[model.vision_model.embeddings.patch_embedding])
+                        
+                        attributions = cam_lib(input_tensor=input_tensor, targets=targets)
+                        road_score_lib = float(np.array(cam_metric(input_tensor, attributions, targets, wrapped_model)).flatten()[0])
+                    except Exception as e:
+                        st.warning(f"Library ROAD calculation failed: {str(e)}")
+                        road_score_lib = None
+                
+            except Exception as e:
+                st.error(f"Error dalam optimasi CAM: {str(e)}")
+                # Fallback ke metode basic
+                st.warning("Menggunakan metode fallback...")
+                
+                wrapped_model = BlipPatchWrapper(model.vision_model.embeddings.patch_embedding)
+                targets = [PatchNormTarget()]
+                
+                if selected_cam == "EigenCAM":
+                    cam = EigenCAM(model=wrapped_model, target_layers=[model.vision_model.embeddings.patch_embedding])
+                    attributions = cam(input_tensor=input_tensor, targets=targets)
+                    cam_map = attributions[0]
+                else:
+                    # Default ke saliency untuk fallback
+                    sal = Saliency(forward_fn)
+                    input_tensor.requires_grad_()
+                    sal_attr = sal.attribute(input_tensor)[0].cpu().permute(1, 2, 0).numpy()
+                    cam_map = np.mean(np.abs(sal_attr), axis=-1)
+                    cam_map = (cam_map - cam_map.min()) / (cam_map.max() - cam_map.min() + 1e-8)
+                
+                road_score_optimized = evaluate_cam_drop(model, input_tensor.clone(), cam_map, mask_ratio)
+                road_score_lib = None
+                elapsed_time = time.time() - start_time
 
-        elif selected_cam == "KPCA-CAM":
-            cam_metric = ROADCombined(percentiles=[20, 40, 60, 80])
-            
-            cam = KPCA_CAM(model=wrapped_model, target_layers=target_layers)
-            attributions = cam(input_tensor=input_tensor, targets=targets)
-            cam_map = attributions[0]
-            
-            # ROAD score dari pytorch-grad-cam
-            try:
-                road_score_lib = float(np.array(cam_metric(input_tensor, attributions, targets, wrapped_model)).flatten()[0])
-            except:
-                road_score_lib = 0.0
-
-        elif selected_cam == "Attention Rollout":
-            def rollout_fn(pixel_values):
-                attn_maps = []
-                def hook(module, input, output):
-                    if isinstance(output, tuple) and output[1] is not None:
-                        attn_maps.append(output[1].detach().cpu())
-                hooks = [layer.self_attn.register_forward_hook(hook) 
-                         for layer in model.vision_model.encoder.layers]
-                with torch.no_grad():
-                    _ = model.vision_model(pixel_values, output_attentions=True)
-                for h in hooks:
-                    h.remove()
-                result = torch.eye(attn_maps[0].shape[-1])
-                for attn in attn_maps:
-                    attn_avg = attn.mean(1) + torch.eye(attn.shape[-1])
-                    attn_avg /= attn_avg.sum(dim=-1, keepdim=True)
-                    result = torch.matmul(attn_avg[0], result)
-                return result[0, 1:]
-
-            rollout = rollout_fn(input_tensor)
-            size = int(np.sqrt(rollout.shape[0]))
-            rollout = rollout[:size**2].reshape(size, size).numpy()
-            cam_map = (rollout - rollout.min()) / (rollout.max() - rollout.min() + 1e-8)
-            road_score_lib = None  # Custom implementation doesn't use pytorch-grad-cam ROAD
-
-        elif selected_cam == "Saliency Map":
-            sal = Saliency(forward_fn)
-            input_tensor.requires_grad_()
-            sal_attr = sal.attribute(input_tensor)[0].cpu().permute(1, 2, 0).numpy()
-            cam_map = np.mean(np.abs(sal_attr), axis=-1)
-            cam_map = (cam_map - cam_map.min()) / (cam_map.max() - cam_map.min() + 1e-8)
+        else:
+            # Fallback ke metode lama jika optimization_level tidak dikenali
+            st.warning("Level optimasi tidak dikenali, menggunakan metode standard")
+            # ... implementasi lama ... cam_map.min()) / (cam_map.max() - cam_map.min() + 1e-8)
             road_score_lib = None  # Custom implementation doesn't use pytorch-grad-cam ROAD
 
         # === Custom ROAD Evaluation ===

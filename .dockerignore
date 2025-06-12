@@ -1,0 +1,6 @@
+# .dockerignore
+
+pipeline_train_eval/
+logs/
+__pycache__/
+*.pyc
